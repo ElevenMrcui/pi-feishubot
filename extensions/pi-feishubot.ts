@@ -260,6 +260,8 @@ export default function (pi: ExtensionAPI) {
 
   // 入站去重兜底（SDK 已有 dedup，这里是防扩展内部重复触发的保险）
   const seenMessages = new Set<string>();
+  // 已完成处理的飞书消息 ID，防止历史消息被重复处理或误触发兜底警告
+  const finalizedMessageIds = new Set<string>();
 
   // ========================================================================
   // 连接
@@ -929,9 +931,17 @@ export default function (pi: ExtensionAPI) {
       if (!m) continue;
       const chatId = m[1];
       const messageId = m[2];
-      const req = requests.get(messageId);
 
-      // 收集该 user 之后所有 assistant 文本（含工具轮次）
+      // 1. 防重：已经 finalize 过或已回复的历史消息跳过
+      if (finalizedMessageIds.has(messageId)) continue;
+
+      const req = requests.get(messageId);
+      if (req && req.finalized) {
+        finalizedMessageIds.add(messageId);
+        continue;
+      }
+
+      // 2. 收集该 user 之后所有 assistant 文本（含工具轮次）
       const parts: string[] = [];
       for (let j = i + 1; j < messages.length; j++) {
         const mm = messages[j];
@@ -940,16 +950,40 @@ export default function (pi: ExtensionAPI) {
           const t = (mm.content as any[])?.find(
             (b: any) => b.type === "text",
           )?.text;
-          if (t) parts.push(t);
+          if (t && t.trim()) parts.push(t.trim());
         }
       }
-      const content =
-        parts.join("\n\n").trim() || "⚠️ 任务已结束，但未产生回复文本。";
+      let content = parts.join("\n\n").trim();
 
+      // 3. 防早夭/防误报核心：
+      // 大模型执行工具调用（如 bash/read/edit）期间，assistant 消息只含 toolCall，text 为空。
+      // 若此时触发 agent_end（多 turn 切换时），如果 agent 还没真正空闲，绝不能提早定格！
+      if (!content) {
+        // 如果卡片在流式过程中已经缓冲了文本，优先采用流式 buffer
+        if (req && req.streamBuffer && req.streamBuffer.trim()) {
+          content = req.streamBuffer.trim();
+        } else if (currentCtx && !currentCtx.isIdle()) {
+          // 任务还在进行中（工具调用中），静默等待后续轮次产出文本
+          continue;
+        }
+      }
+
+      // 4. 如果任务确实彻底结束，但依然没有任何文本：
+      if (!content) {
+        if (!req) {
+          // 历史孤儿消息，坚决不向飞书补发无意义的告警
+          finalizedMessageIds.add(messageId);
+          continue;
+        }
+        content = "⚠️ 任务已结束，但未产生回复文本。";
+      }
+
+      // 5. 正式定格或发送
+      finalizedMessageIds.add(messageId);
       if (req) {
         await finalizeRequest(req, content);
       } else {
-        // 无上下文（如扩展重载后收尾）→ 兜底直发
+        // 仅当从未处理过且确实有新文本产生时，才向会话兜底发送
         await sendToChat(chatId, content);
       }
     }
