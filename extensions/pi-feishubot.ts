@@ -406,6 +406,34 @@ export default function (pi: ExtensionAPI) {
     return join(INBOX_ROOT, String(pid));
   }
 
+  /** 网关代发信箱：outbox/{gatewayPid}/{ts}-{rand}.json —— 工作实例的回复委托网关发出 */
+  async function delegateSend(gatewayPid: number, chatId: string, md: string) {
+    const dir = join(INBOX_ROOT, String(gatewayPid), "outbox");
+    if (!existsSync(dir)) {
+      await mkdir(dir, { recursive: true }).catch(() => {});
+    }
+    const file = join(
+      dir,
+      `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`,
+    );
+    await writeFile(file, JSON.stringify({ kind: "send", chatId, md }));
+  }
+
+  /** 回复出口：本实例有 WS 就自己发；否则委托网关代发（跨实例回复的救命通路） */
+  async function sendReplyOut(chatId: string, md: string) {
+    if (channel) {
+      await sendToChat(chatId, md);
+      return;
+    }
+    const live = await listLiveInstances();
+    const gw = electGateway(live);
+    if (gw && gw.pid !== SELF_PID) {
+      await delegateSend(gw.pid, chatId, md);
+      return;
+    }
+    console.error("[feishubot] 回复无法送达：本实例无 WS 且无存活网关");
+  }
+
   /** 把飞书消息投递到目标实例的信箱（oc_ 路由键 + 完整信封） */
   async function routeToInstance(target: InstanceInfo, payload: {
     chatId: string; messageId: string; senderName: string; threadId?: string; text: string;
@@ -476,6 +504,32 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /** 网关消费 outbox：替工作实例把回复发到飞书 */
+  let outboxDraining = false;
+  async function drainOutbox() {
+    if (outboxDraining || !channel) return;
+    outboxDraining = true;
+    try {
+      const dir = join(INBOX_ROOT, String(SELF_PID), "outbox");
+      if (!existsSync(dir)) return;
+      for (const f of await readdir(dir)) {
+        if (!f.endsWith(".json")) continue;
+        const fp = join(dir, f);
+        try {
+          const payload = JSON.parse(await readFile(fp, "utf8"));
+          await rm(fp).catch(() => {});
+          if (payload?.kind === "send" && payload.chatId && payload.md) {
+            await sendToChat(payload.chatId, payload.md);
+          }
+        } catch (e: any) {
+          console.error("[feishubot] outbox 处理失败:", e?.message || e);
+        }
+      }
+    } finally {
+      outboxDraining = false;
+    }
+  }
+
   function startInboxWatcher() {
     const dir = inboxDir(SELF_PID);
     if (!existsSync(dir)) {
@@ -506,6 +560,8 @@ export default function (pi: ExtensionAPI) {
           await connect(ctx, { force: true });
         }
       } catch {}
+      // 网关身份则消费 outbox（工作实例委托的回复）
+      if (isGateway && channel) await drainOutbox();
     }, HEARTBEAT_MS);
   }
 
@@ -1429,7 +1485,11 @@ export default function (pi: ExtensionAPI) {
     // 快捷指令：零 token 秒回
     if (isFastCommandText(text)) {
       const handled = await handleFastCommand(req, text);
-      if (handled) return;
+      if (handled) {
+        // 顺带消费 outbox（降低工作实例委托回复的延迟）
+        if (isGateway && channel) await drainOutbox();
+        return;
+      }
     }
 
     // 【会话路由】oc_ 即路由键：绑定表(实时读盘) → 定位承载该会话的存活实例 → 信箱投递。
@@ -1587,11 +1647,11 @@ export default function (pi: ExtensionAPI) {
 
       // 5. 正式定格或发送
       finalizedMessageIds.add(messageId);
-      if (req) {
+      if (req && !req.viaInbox) {
         await finalizeRequest(req, content);
       } else {
-        // 仅当从未处理过且确实有新文本产生时，才向会话兜底发送
-        await sendToChat(chatId, content);
+        // 跨实例投递的消息（或无上下文）：走回复出口（有 WS 自己发，否则委托网关）
+        await sendReplyOut(chatId, content);
       }
     }
   });
