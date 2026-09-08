@@ -252,6 +252,9 @@ interface FeishuRequest {
   streamAppended: number; // 已 append 的字符数
   streamPlaceholder?: string | null; // "处理中"占位文本（占位卡首刷时覆盖）
   ackTimer: NodeJS.Timeout | null; // 2.5s 占位回执定时器
+  aliveTimer: NodeJS.Timeout | null; // 运行心跳定时器（占位期更新"仍在运行 n s"）
+  lastActivityAt: number; // 最近一次内容活动（delta/append）时间
+  startedAtMs?: number;
   finalized: boolean;
   viaInbox?: boolean; // 来自其它实例投递（回复走兜底直发，无流式卡片）
 }
@@ -434,6 +437,9 @@ export default function (pi: ExtensionAPI) {
         streamFlushTimer: null,
         streamAppended: 0,
         ackTimer: null,
+        aliveTimer: null,
+        lastActivityAt: 0,
+        startedAtMs: Date.now(),
         finalized: false,
         viaInbox: true,
       };
@@ -798,6 +804,21 @@ export default function (pi: ExtensionAPI) {
       // 已在流式/已完结/卡片已建 → 不需要占位
       if (req.finalized || req.phase !== "thinking" || req.streamCtrl) return;
       ensureStream(req, ACK_PLACEHOLDER);
+      // 占位期心跳：每 10s 更新"仍在运行"，让用户确认没有失踪
+      const started = Date.now();
+      req.aliveTimer = setInterval(async () => {
+        if (req.finalized || req.phase !== "thinking" || !req.streamCtrl) {
+          if (req.aliveTimer) {
+            clearInterval(req.aliveTimer);
+            req.aliveTimer = null;
+          }
+          return;
+        }
+        const sec = Math.round((Date.now() - started) / 1000);
+        try {
+          await req.streamCtrl.setContent(`🫥 仍在运行… ${sec}s`);
+        } catch {}
+      }, 10_000);
     }, ACK_DELAY_MS);
   }
 
@@ -805,6 +826,7 @@ export default function (pi: ExtensionAPI) {
   function ensureStream(req: FeishuRequest, placeholder?: string) {
     if (req.phase !== "thinking" || !channel) return;
     req.phase = "streaming";
+    if (!req.lastActivityAt) req.lastActivityAt = Date.now();
     if (placeholder) req.streamPlaceholder = placeholder;
 
     // 关键：producer 必须保持 pending 直到流真正结束。
@@ -817,6 +839,21 @@ export default function (pi: ExtensionAPI) {
       req.streamFlushTimer = setInterval(async () => {
         if (req.finalized || !req.streamCtrl) return;
         const buf = req.streamBuffer;
+        // 运行心跳：流式静默超过 15s（长工具期）→ 追加一行可见的存活提示
+        // （finalize 时 setContent 全文覆盖，心跳行不会留在最终结果里）
+        const silentMs = Date.now() - (req.lastActivityAt || req.startedAtMs || Date.now());
+        if (
+          buf.length === req.streamAppended &&
+          req.streamAppended > 0 &&
+          silentMs > 15_000
+        ) {
+          const sec = Math.round(silentMs / 1000);
+          try {
+            await req.streamCtrl.append(`\n\n⏱ 仍在执行，已 ${sec}s…`);
+            req.lastActivityAt = Date.now();
+          } catch {}
+          return;
+        }
         if (buf.length > req.streamAppended) {
           // 占位卡首刷：setContent 全量覆盖"正在处理"占位文本
           if (req.streamPlaceholder) {
@@ -869,6 +906,10 @@ export default function (pi: ExtensionAPI) {
     req.finalized = true;
     req.phase = "done";
     clearAckTimer(req);
+    if (req.aliveTimer) {
+      clearInterval(req.aliveTimer);
+      req.aliveTimer = null;
+    }
 
     if (req.streamFlushTimer) {
       clearInterval(req.streamFlushTimer);
@@ -1369,6 +1410,9 @@ export default function (pi: ExtensionAPI) {
       streamFlushTimer: null,
       streamAppended: 0,
       ackTimer: null,
+      aliveTimer: null,
+      lastActivityAt: 0,
+      startedAtMs: Date.now(),
       finalized: false,
     };
 
@@ -1448,6 +1492,7 @@ export default function (pi: ExtensionAPI) {
     const req = activeRequest;
     if (!req || req.finalized) return;
     req.streamBuffer += evt.delta;
+    req.lastActivityAt = Date.now();
     ensureStream(req);
   });
 
