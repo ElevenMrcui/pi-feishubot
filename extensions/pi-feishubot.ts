@@ -114,7 +114,7 @@ async function deleteConfig() {
 // ============================================================================
 
 const FAST_COMMAND_RE =
-  /^(帮助|help|\/help|状态|进度|status|\/status|停止|中止|stop|\/stop|\/abort|当前模型|查看模型|模型|\/model|列出模型|可用模型|models|\/models|新会话|清空|\/new|\/clear|会话|sessions|\/sessions|会话列表|列表会话|实例|instances|实例列表)$/i;
+  /^(帮助|help|\/help|状态|进度|status|\/status|停止|中止|stop|\/stop|\/abort|当前模型|查看模型|模型|\/model|列出模型|可用模型|models|\/models|新会话|清空|\/new|\/clear|会话|sessions|\/sessions|会话列表|列表会话|实例|instances|实例列表|reload|重载|\/reload)$/i;
 const MODEL_SWITCH_RE = /^(?:切换模型(?:到)?|\/model)\s+(.+)$/i;
 /** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
 const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
@@ -250,6 +250,8 @@ interface FeishuRequest {
   streamBuffer: string;
   streamFlushTimer: NodeJS.Timeout | null;
   streamAppended: number; // 已 append 的字符数
+  streamPlaceholder?: string | null; // "处理中"占位文本（占位卡首刷时覆盖）
+  ackTimer: NodeJS.Timeout | null; // 2.5s 占位回执定时器
   finalized: boolean;
   viaInbox?: boolean; // 来自其它实例投递（回复走兜底直发，无流式卡片）
 }
@@ -431,6 +433,7 @@ export default function (pi: ExtensionAPI) {
         streamBuffer: "",
         streamFlushTimer: null,
         streamAppended: 0,
+        ackTimer: null,
         finalized: false,
         viaInbox: true,
       };
@@ -444,6 +447,7 @@ export default function (pi: ExtensionAPI) {
       await pi.sendUserMessage([{ type: "text", text: injectText }], {
         deliverAs: "steer",
       });
+      scheduleAck(req);
     } catch (e: any) {
       console.error("[feishubot] inbox 处理失败:", e?.message || e);
     }
@@ -773,10 +777,35 @@ export default function (pi: ExtensionAPI) {
   // 流式打字机
   // ========================================================================
 
-  /** 首个 text_delta 到达时建立流式卡片 + flush 定时器 */
-  function ensureStream(req: FeishuRequest) {
+  /**
+   * 占位回执：注入后 2.5s 仍未出字 → 提前建卡显示"正在处理"，
+   * 首个真实增量会原地覆盖占位（全程一张卡片，无撤回）。
+   */
+  const ACK_DELAY_MS = 2500;
+  const ACK_PLACEHOLDER = "🫥 正在处理…";
+
+  function clearAckTimer(req: FeishuRequest) {
+    if (req.ackTimer) {
+      clearTimeout(req.ackTimer);
+      req.ackTimer = null;
+    }
+  }
+
+  function scheduleAck(req: FeishuRequest) {
+    clearAckTimer(req);
+    req.ackTimer = setTimeout(() => {
+      req.ackTimer = null;
+      // 已在流式/已完结/卡片已建 → 不需要占位
+      if (req.finalized || req.phase !== "thinking" || req.streamCtrl) return;
+      ensureStream(req, ACK_PLACEHOLDER);
+    }, ACK_DELAY_MS);
+  }
+
+  /** 建立流式卡片 + flush 定时器（首个 text_delta 或 2.5s 占位回执时触发） */
+  function ensureStream(req: FeishuRequest, placeholder?: string) {
     if (req.phase !== "thinking" || !channel) return;
     req.phase = "streaming";
+    if (placeholder) req.streamPlaceholder = placeholder;
 
     // 关键：producer 必须保持 pending 直到流真正结束。
     // SDK 的 run(producer) 在 producer resolve 时立即 completeTerminal() 完结卡片；
@@ -789,6 +818,15 @@ export default function (pi: ExtensionAPI) {
         if (req.finalized || !req.streamCtrl) return;
         const buf = req.streamBuffer;
         if (buf.length > req.streamAppended) {
+          // 占位卡首刷：setContent 全量覆盖"正在处理"占位文本
+          if (req.streamPlaceholder) {
+            req.streamPlaceholder = null;
+            req.streamAppended = buf.length;
+            try {
+              await req.streamCtrl.setContent(buf);
+            } catch {}
+            return;
+          }
           const chunk = buf.slice(req.streamAppended);
           req.streamAppended = buf.length;
           try {
@@ -830,6 +868,7 @@ export default function (pi: ExtensionAPI) {
     if (req.finalized) return;
     req.finalized = true;
     req.phase = "done";
+    clearAckTimer(req);
 
     if (req.streamFlushTimer) {
       clearInterval(req.streamFlushTimer);
@@ -896,6 +935,7 @@ export default function (pi: ExtensionAPI) {
           "- `绑定会话 <关键词>` — 本聊天固定路由到该会话",
           "- `解绑会话` — 解除路由绑定",
           "- `实例` — 查看运行中的 Pi 实例与路由角色",
+          "- `reload` — 重载当前 pi 实例的扩展与配置",
           "- `新会话` / `/new` — 重置会话上下文",
           "",
           "**模型管理**",
@@ -1053,6 +1093,28 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         await reply(`❌ 开启新会话失败: ${e?.message || e}`);
       }
+      return true;
+    }
+
+    // 【重载扩展】reload / 重载 / /reload —— 重载收到消息的这个 pi 实例
+    if (lower === "reload" || lower === "重载" || lower === "/reload") {
+      await reply("🔄 收到，正在重载当前 pi 实例的扩展与配置…");
+      // 让回执先送达，再异步触发（reload 会 invalidate 当前扩展上下文）
+      setTimeout(async () => {
+        try {
+          const ctxAny = currentCtx as any;
+          if (ctxAny && typeof ctxAny.reload === "function") {
+            await ctxAny.reload();
+          } else {
+            await pi.sendUserMessage(
+              [{ type: "text", text: "/feishubot-reload" }],
+              { expandPromptTemplates: true } as any,
+            );
+          }
+        } catch (e: any) {
+          console.error("[feishubot] reload 失败:", e?.message || e);
+        }
+      }, 400);
       return true;
     }
 
@@ -1306,6 +1368,7 @@ export default function (pi: ExtensionAPI) {
       streamBuffer: "",
       streamFlushTimer: null,
       streamAppended: 0,
+      ackTimer: null,
       finalized: false,
     };
 
@@ -1361,6 +1424,7 @@ export default function (pi: ExtensionAPI) {
       await pi.sendUserMessage([{ type: "text", text: injectText }], {
         deliverAs: "steer",
       });
+      scheduleAck(req);
     } catch (e) {
       console.error("[feishubot] 注入 pi 失败:", e);
       requests.delete(req.messageId);
@@ -1585,6 +1649,15 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, cmdCtx) => {
       if (typeof cmdCtx.newSession === "function") {
         await cmdCtx.newSession();
+      }
+    },
+  });
+
+  pi.registerCommand("feishubot-reload", {
+    description: "飞书内部重载扩展通道",
+    handler: async (_args, cmdCtx) => {
+      if (typeof cmdCtx.reload === "function") {
+        await cmdCtx.reload();
       }
     },
   });
