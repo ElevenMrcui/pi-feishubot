@@ -105,8 +105,8 @@ async function deleteConfig() {
 const FAST_COMMAND_RE =
   /^(帮助|help|\/help|状态|进度|status|\/status|停止|中止|stop|\/stop|\/abort|当前模型|查看模型|模型|\/model|列出模型|可用模型|models|\/models|新会话|清空|\/new|\/clear|会话|sessions|\/sessions|会话列表|列表会话)$/i;
 const MODEL_SWITCH_RE = /^(?:切换模型(?:到)?|\/model)\s+(.+)$/i;
-/** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` */
-const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/session)\s+(.+)$/i;
+/** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
+const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
 
 function isFastCommandText(content: string): boolean {
   const s = content.trim();
@@ -712,11 +712,19 @@ export default function (pi: ExtensionAPI) {
       lower === "/new" ||
       lower === "/clear"
     ) {
-      if (typeof (currentCtx as any)?.newSession === "function") {
-        await (currentCtx as any).newSession();
+      try {
+        if (typeof (currentCtx as any)?.newSession === "function") {
+          await (currentCtx as any).newSession();
+        } else {
+          // 通过扩展命令分发通道触发，注入 CommandContext，零 token
+          await pi.sendUserMessage(
+            [{ type: "text", text: "/feishubot-new-session" }],
+            { expandPromptTemplates: true } as any,
+          );
+        }
         await reply("✨ 已开启全新会话。");
-      } else {
-        await reply("✨ 当前环境不支持会话重置，直接发送新指令即可。");
+      } catch (e: any) {
+        await reply(`❌ 开启新会话失败: ${e?.message || e}`);
       }
       return true;
     }
@@ -798,20 +806,24 @@ export default function (pi: ExtensionAPI) {
         await reply(
           "❌ 未找到目标会话。先发 `会话` 查看列表（序号 10 分钟内有效）。",
         );
-      } else if (typeof (currentCtx as any)?.switchSession === "function") {
+      } else {
+        const targetName =
+          target.name || target._displayName || target.id.slice(0, 8);
         try {
-          await (currentCtx as any).switchSession(target.path);
+          if (typeof (currentCtx as any)?.switchSession === "function") {
+            await (currentCtx as any).switchSession(target.path);
+          } else {
+            // 通过扩展命令分发通道触发，注入 CommandContext 执行 switchSession，零 token
+            await pi.sendUserMessage(
+              [{ type: "text", text: `/feishubot-switch-session ${target.path}` }],
+              { expandPromptTemplates: true } as any,
+            );
+          }
           lastSessionList = [];
-          await reply(
-            `✅ 已切换到会话 **${target.name || target._displayName || target.id.slice(0, 8)}**`,
-          );
+          await reply(`✅ 已成功切换到会话：**${targetName}**`);
         } catch (e: any) {
           await reply(`❌ 切换失败: ${e?.message || e}`);
         }
-      } else {
-        await reply(
-          "⚠️ 远程环境限制：会话热切换为 pi 终端专属指令（受引擎沙箱保护，无法从后台远程强切）。建议在本地终端按需切换，或直接在此会话发送新需求。",
-        );
       }
       return true;
     }
@@ -1064,6 +1076,27 @@ export default function (pi: ExtensionAPI) {
         `飞书机器人: ${connected ? "✅ 已连接" : "❌ 未连接"}\nBot: ${botName}\nAppID: ${cfg.appId}`,
         "info",
       );
+    },
+  });
+
+  // 内部命令：由 pi 核心以 ExtensionCommandContext 执行，具备 switchSession 与 newSession 权限
+  pi.registerCommand("feishubot-switch-session", {
+    description: "飞书内部会话切换通道",
+    handler: async (args, cmdCtx) => {
+      const sessionPath = args.trim();
+      if (!sessionPath) return;
+      if (typeof cmdCtx.switchSession === "function") {
+        await cmdCtx.switchSession(sessionPath);
+      }
+    },
+  });
+
+  pi.registerCommand("feishubot-new-session", {
+    description: "飞书内部新建会话通道",
+    handler: async (_args, cmdCtx) => {
+      if (typeof cmdCtx.newSession === "function") {
+        await cmdCtx.newSession();
+      }
     },
   });
 }
