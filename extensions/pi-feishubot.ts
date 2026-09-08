@@ -781,7 +781,7 @@ export default function (pi: ExtensionAPI) {
    * 占位回执：注入后 2.5s 仍未出字 → 提前建卡显示"正在处理"，
    * 首个真实增量会原地覆盖占位（全程一张卡片，无撤回）。
    */
-  const ACK_DELAY_MS = 2500;
+  const ACK_DELAY_MS = 1000;
   const ACK_PLACEHOLDER = "🫥 正在处理…";
 
   function clearAckTimer(req: FeishuRequest) {
