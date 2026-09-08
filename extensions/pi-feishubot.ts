@@ -23,10 +23,12 @@ import {
   unlink,
   open,
   stat,
+  readdir,
+  rm,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { createRequire } from "node:module";
 
 import type {
@@ -77,6 +79,12 @@ const CONFIG_DIR = join(homedir(), ".pi", "agent", "feishu-bot");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 /** 会话路由表：飞书 chatId → 绑定的 pi 会话文件绝对路径（持久化） */
 const BINDINGS_FILE = join(CONFIG_DIR, "bindings.json");
+/** 实例注册表目录：instances/{pid}.json（心跳续约，死实例自动清理） */
+const INSTANCES_DIR = join(CONFIG_DIR, "instances");
+/** 跨实例投递信箱：inbox/{pid}/{messageId}.json */
+const INBOX_ROOT = join(CONFIG_DIR, "inbox");
+const HEARTBEAT_MS = 15_000;
+const STALE_MS = 45_000;
 
 async function loadConfig(): Promise<FeishuBotConfig | null> {
   try {
@@ -106,7 +114,7 @@ async function deleteConfig() {
 // ============================================================================
 
 const FAST_COMMAND_RE =
-  /^(帮助|help|\/help|状态|进度|status|\/status|停止|中止|stop|\/stop|\/abort|当前模型|查看模型|模型|\/model|列出模型|可用模型|models|\/models|新会话|清空|\/new|\/clear|会话|sessions|\/sessions|会话列表|列表会话)$/i;
+  /^(帮助|help|\/help|状态|进度|status|\/status|停止|中止|stop|\/stop|\/abort|当前模型|查看模型|模型|\/model|列出模型|可用模型|models|\/models|新会话|清空|\/new|\/clear|会话|sessions|\/sessions|会话列表|列表会话|实例|instances|实例列表)$/i;
 const MODEL_SWITCH_RE = /^(?:切换模型(?:到)?|\/model)\s+(.+)$/i;
 /** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
 const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
@@ -243,6 +251,7 @@ interface FeishuRequest {
   streamFlushTimer: NodeJS.Timeout | null;
   streamAppended: number; // 已 append 的字符数
   finalized: boolean;
+  viaInbox?: boolean; // 来自其它实例投递（回复走兜底直发，无流式卡片）
 }
 
 /** 流式卡片 flush 间隔（飞书卡片更新限流友好） */
@@ -272,8 +281,14 @@ export default function (pi: ExtensionAPI) {
   const seenMessages = new Set<string>();
   // 已完成处理的飞书消息 ID，防止历史消息被重复处理或误触发兜底警告
   const finalizedMessageIds = new Set<string>();
-  // 会话路由表：chatId → 会话文件路径（持久化到 bindings.json）
+  // 会话路由表缓存：chatId → 会话文件路径（读操作实时读盘，写后同步缓存）
   let chatBindings: Record<string, string> = {};
+  // 实例角色与心跳
+  const SELF_PID = process.pid;
+  let isGateway = false;
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  let inboxWatcher: FSWatcher | null = null;
+  const startedAt = Date.now();
 
   /** 当前实例所处的会话文件路径 */
   function currentSessionFile(): string {
@@ -301,6 +316,185 @@ export default function (pi: ExtensionAPI) {
       await chmod(CONFIG_DIR, 0o700).catch(() => {});
     }
     await writeFile(BINDINGS_FILE, JSON.stringify(chatBindings, null, 2));
+  }
+
+  /** 绑定表实时读盘（多实例下手动改文件/另一实例写入立即生效） */
+  async function freshBindings(): Promise<Record<string, string>> {
+    try {
+      return JSON.parse(await readFile(BINDINGS_FILE, "utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  // ---------------- 实例注册表（多实例自动入网 + 运行中查询） ----------------
+
+  interface InstanceInfo {
+    pid: number;
+    sessionFile: string;
+    sessionName: string;
+    cwd: string;
+    startedAt: number;
+    heartbeat: number;
+  }
+
+  async function writeInstanceHeartbeat() {
+    if (!existsSync(INSTANCES_DIR)) {
+      await mkdir(INSTANCES_DIR, { recursive: true }).catch(() => {});
+    }
+    const info: InstanceInfo = {
+      pid: SELF_PID,
+      sessionFile: currentSessionFile(),
+      sessionName: (currentCtx as any)?.sessionManager?.getSessionName?.() || "",
+      cwd: currentCtx?.cwd || process.cwd(),
+      startedAt,
+      heartbeat: Date.now(),
+    };
+    await writeFile(
+      join(INSTANCES_DIR, `${SELF_PID}.json`),
+      JSON.stringify(info, null, 2),
+    ).catch(() => {});
+  }
+
+  /** 列出存活实例（心跳新鲜）；顺带清理僵尸注册文件 */
+  async function listLiveInstances(): Promise<InstanceInfo[]> {
+    const out: InstanceInfo[] = [];
+    try {
+      for (const f of await readdir(INSTANCES_DIR)) {
+        if (!f.endsWith(".json")) continue;
+        const fp = join(INSTANCES_DIR, f);
+        try {
+          const info = JSON.parse(await readFile(fp, "utf8")) as InstanceInfo;
+          if (Date.now() - info.heartbeat > STALE_MS) {
+            await rm(fp).catch(() => {});
+            continue;
+          }
+          out.push(info);
+        } catch {
+          await rm(fp).catch(() => {});
+        }
+      }
+    } catch {}
+    return out.sort((a, b) => a.startedAt - b.startedAt || a.pid - b.pid);
+  }
+
+  /** 网关 = 存活实例中 startedAt 最早者（确定性选举，所有实例算出同一结果） */
+  function electGateway(instances: InstanceInfo[]): InstanceInfo | null {
+    return instances[0] || null;
+  }
+
+  /** 按会话文件找承载它的存活实例 */
+  async function findInstanceBySession(sessionFile: string): Promise<InstanceInfo | null> {
+    const live = await listLiveInstances();
+    return (
+      live.find((x) => x.pid !== SELF_PID && x.sessionFile === sessionFile) ||
+      live.find((x) => x.sessionFile === sessionFile) ||
+      null
+    );
+  }
+
+  // ---------------- 跨实例信箱投递 ----------------
+
+  function inboxDir(pid: number) {
+    return join(INBOX_ROOT, String(pid));
+  }
+
+  /** 把飞书消息投递到目标实例的信箱（oc_ 路由键 + 完整信封） */
+  async function routeToInstance(target: InstanceInfo, payload: {
+    chatId: string; messageId: string; senderName: string; threadId?: string; text: string;
+  }) {
+    const dir = inboxDir(target.pid);
+    if (!existsSync(dir)) {
+      await mkdir(dir, { recursive: true }).catch(() => {});
+    }
+    const file = join(dir, `${payload.messageId}.json`);
+    await writeFile(file, JSON.stringify({ ...payload, toPid: target.pid, ts: Date.now() }));
+  }
+
+  /** 处理投递进来的消息：直接注入本实例（本实例就在目标会话里，零切换） */
+  async function processInboxItem(file: string) {
+    try {
+      const payload = JSON.parse(await readFile(file, "utf8"));
+      await rm(file).catch(() => {});
+      if (!payload?.messageId || !payload?.chatId || !payload?.text) return;
+      if (seenMessages.has(payload.messageId)) return;
+      seenMessages.add(payload.messageId);
+      setTimeout(() => seenMessages.delete(payload.messageId), 10 * 60 * 1000);
+
+      const req: FeishuRequest = {
+        chatId: payload.chatId,
+        messageId: payload.messageId,
+        senderName: payload.senderName || "用户",
+        threadId: payload.threadId,
+        phase: "thinking",
+        streamCtrl: null,
+        streamBuffer: "",
+        streamFlushTimer: null,
+        streamAppended: 0,
+        finalized: false,
+        viaInbox: true,
+      };
+      if (isFastCommandText(payload.text)) {
+        const handled = await handleFastCommand(req, payload.text);
+        if (handled) return;
+      }
+      requests.set(req.messageId, req);
+      activeRequest = req;
+      const injectText = `[feishubot] [${req.senderName}] [${req.chatId}] [${req.messageId}]\n${payload.text}`;
+      await pi.sendUserMessage([{ type: "text", text: injectText }], {
+        deliverAs: "steer",
+      });
+    } catch (e: any) {
+      console.error("[feishubot] inbox 处理失败:", e?.message || e);
+    }
+  }
+
+  let draining = false;
+  async function drainInbox() {
+    if (draining) return;
+    draining = true;
+    try {
+      const dir = inboxDir(SELF_PID);
+      if (!existsSync(dir)) return;
+      for (const f of await readdir(dir)) {
+        if (f.endsWith(".json")) await processInboxItem(join(dir, f));
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
+  function startInboxWatcher() {
+    const dir = inboxDir(SELF_PID);
+    if (!existsSync(dir)) {
+      mkdir(dir, { recursive: true }).catch(() => {});
+    }
+    try {
+      inboxWatcher?.close();
+    } catch {}
+    try {
+      inboxWatcher = fsWatch(dir, () => void drainInbox());
+    } catch (e: any) {
+      console.error("[feishubot] inbox watch 失败:", e?.message);
+    }
+    // 启动时处理残留（上次崩溃/退出未消费的）
+    void drainInbox();
+  }
+
+  /** 启动心跳：注册续约 + 网关重选（原网关死亡时自动顶上接管 WS） */
+  function startHeartbeat(ctx: ExtensionContext) {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(async () => {
+      await writeInstanceHeartbeat();
+      try {
+        const live = await listLiveInstances();
+        const gw = electGateway(live);
+        if (gw && gw.pid === SELF_PID && !isGateway) {
+          console.log("[feishubot] 原网关下线，本实例接管 WS…");
+          await connect(ctx, { force: true });
+        }
+      } catch {}
+    }, HEARTBEAT_MS);
   }
 
   /**
@@ -401,13 +595,31 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  async function connect(ctx: ExtensionContext): Promise<boolean> {
+  async function connect(
+    ctx: ExtensionContext,
+    opts: { force?: boolean } = {},
+  ): Promise<boolean> {
     currentCtx = ctx;
     const cfg = await loadConfig();
     if (!cfg) {
       ctx.ui.notify("飞书机器人未配置：/feishubot-add 添加凭据", "warning");
       return false;
     }
+
+    // 多实例单连接仲裁：只有选举出的网关实例才持有飞书 WS，
+    // 其余实例作为工作节点通过 inbox 接收路由消息（防止双连接消息随机分发导致串会话）
+    if (!opts.force) {
+      const live = await listLiveInstances();
+      const gw = electGateway(live);
+      if (gw && gw.pid !== SELF_PID) {
+        isGateway = false;
+        console.log(
+          `[feishubot] 检测到网关实例 PID ${gw.pid}，本实例以工作模式运行（收 inbox 路由）`,
+        );
+        return false;
+      }
+    }
+    isGateway = true;
 
     disconnect();
 
@@ -683,6 +895,7 @@ export default function (pi: ExtensionAPI) {
           "- `切会话 <序号/ID/名称>` — 切换到指定会话",
           "- `绑定会话 <关键词>` — 本聊天固定路由到该会话",
           "- `解绑会话` — 解除路由绑定",
+          "- `实例` — 查看运行中的 Pi 实例与路由角色",
           "- `新会话` / `/new` — 重置会话上下文",
           "",
           "**模型管理**",
@@ -738,6 +951,7 @@ export default function (pi: ExtensionAPI) {
         `- **模型**: \`${model?.id || "默认"}\` (${model?.provider || "未知"})`,
         `- **上下文**: ${usage}`,
         `- **工作目录**: \`${currentCtx?.cwd || process.cwd()}\``,
+        `- **实例角色**: PID ${SELF_PID} ${isGateway ? "· 🌐网关(接飞书)" : "· 工作节点(收路由)"}`,
       ];
       if (busy && activeToolInfo) {
         const toolSec = Math.round(
@@ -839,6 +1053,38 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         await reply(`❌ 开启新会话失败: ${e?.message || e}`);
       }
+      return true;
+    }
+
+    // 【实例列表】查询运行中的 pi 实例（注册表实时快照）
+    if (
+      lower === "实例" ||
+      lower === "instances" ||
+      lower === "实例列表"
+    ) {
+      const live = await listLiveInstances();
+      const bindings = await freshBindings();
+      const lines = [`### 🖥 运行中的 Pi 实例 (共 ${live.length})`, ""];
+      live.forEach((inst, i) => {
+        const up = Math.round((Date.now() - inst.startedAt) / 60000);
+        const upStr = up >= 60 ? `${Math.floor(up / 60)}h${up % 60}m` : `${up}m`;
+        const gw = electGateway(live);
+        const role =
+          gw && gw.pid === inst.pid ? " · 🌐网关" : "";
+        const selfMark = inst.pid === SELF_PID ? " *(本实例)*" : "";
+        const bindChat = Object.entries(bindings)
+          .filter(([, p]) => p === inst.sessionFile)
+          .map(([c]) => c.slice(0, 10) + "…");
+        lines.push(
+          `${i + 1}. **${inst.sessionName || inst.sessionFile.split("/").pop()?.slice(0, 30) || "未命名"}**${selfMark}`,
+          `   • PID: ${inst.pid} · 运行 ${upStr}${role}`,
+          `   • 目录: \`${inst.cwd}\``,
+          bindChat.length ? `   • 绑定聊天: ${bindChat.join(", ")}` : "",
+          "",
+        );
+      });
+      lines.push("💡 发消息时按 绑定表 路由到对应实例执行；未绑定的进网关当前会话。");
+      await reply(lines.filter((x) => x !== "").join("\n").replace(" ,", ",").replace("\n\n\n", "\n\n"));
       return true;
     }
 
@@ -991,22 +1237,16 @@ export default function (pi: ExtensionAPI) {
         target._displayName ||
         target.firstMessage?.slice(0, 20) ||
         target.id.slice(0, 8);
-      const curFile = currentSessionFile();
-      const switchedNow =
-        curFile && target.path !== curFile && currentCtx && currentCtx.isIdle();
-      if (switchedNow) {
-        try {
-          await performSwitch(target.path);
-          lastSessionList = [];
-        } catch {}
-      }
+      const inst = await findInstanceBySession(target.path);
+      const instLine = inst
+        ? `- 承载实例: PID ${inst.pid}${inst.pid === SELF_PID ? "（本实例）" : ""}`
+        : `- ⚠️ 该会话当前没有运行中的 Pi（启动后自动加入路由）`;
       await reply(
         [
           `📍 **已绑定路由**：本聊天 → 会话 **${targetName}**`,
           `- **会话ID**: \`${target.id}\``,
-          switchedNow
-            ? `- 已立即切换过去，现在发消息直达该会话`
-            : `- 之后发消息自动路由到该会话（任务执行中会暂缓路由）`,
+          instLine,
+          `- 之后本聊天的消息自动路由到该会话执行，回传结果到本聊天`,
           `- 解除：发 \`解绑会话\``,
         ].join("\n"),
       );
@@ -1075,22 +1315,39 @@ export default function (pi: ExtensionAPI) {
       if (handled) return;
     }
 
-    // 【会话路由】绑定表优先：本聊天绑定了会话且不是当前所处会话 → 自动路由过去
-    const boundPath = chatBindings[req.chatId];
+    // 【会话路由】oc_ 即路由键：绑定表(实时读盘) → 定位承载该会话的存活实例 → 信箱投递。
+    // 本实例绝不因路由而切换会话——各实例守各自会话，消息走 inbox 跨实例传送。
+    const bindings = await freshBindings();
+    const boundPath = bindings[req.chatId];
+    chatBindings = bindings;
     if (boundPath && boundPath !== currentSessionFile()) {
-      if (currentCtx && !currentCtx.isIdle()) {
-        // 任务执行中绝不切换（保住正在跑的任务），给出明确提示
+      const target = await findInstanceBySession(boundPath);
+      if (!target) {
+        const st = await sessionDisplayName({ path: boundPath, id: boundPath });
         await replyMarkdown(
           req,
-          "⏳ 当前有任务执行中，本消息暂未路由到绑定会话。任务完成或发 `停止` 后重发即可。",
+          [
+            `❌ 该会话当前没有运行中的 Pi 实例：`,
+            `- 会话: **${st}**`,
+            `- 先在对应终端启动 pi（可用 \`pi -r ${boundPath.split("/").pop()}\`），实例会自动加入路由。`,
+            `- 发 \`实例\` 查看当前运行中的实例。`,
+          ].join("\n"),
         );
         return;
       }
-      try {
-        await performSwitch(boundPath);
-      } catch (e: any) {
-        await replyMarkdown(req, `❌ 路由到绑定会话失败: ${e?.message || e}`);
-        return;
+      if (target.pid !== SELF_PID) {
+        // 全局查询/绑定类指令留在网关本地处理，其余（含 停止/状态/普通消息）投递给目标实例
+        const LOCAL_ONLY = /^(?:会话|sessions|\/sessions|会话列表|列表会话|实例|instances|绑定会话|解绑会话|bind\b)/i;
+        if (!LOCAL_ONLY.test(text)) {
+          await routeToInstance(target, {
+            chatId: req.chatId,
+            messageId: req.messageId,
+            senderName: req.senderName,
+            threadId: req.threadId,
+            text,
+          });
+          return; // 投递完成，网关不再处理（回复由目标实例经 agent_end 兑底直发）
+        }
       }
     }
 
@@ -1228,9 +1485,14 @@ export default function (pi: ExtensionAPI) {
     currentCtx = ctx;
     if (!SDK) return;
     await loadBindings();
+    // 实例注册 + 心跳（多实例自动入网；新实例启动即出现在 实例 列表）
+    await writeInstanceHeartbeat();
+    startHeartbeat(ctx);
+    startInboxWatcher();
+    await drainInbox();
     const cfg = await loadConfig();
     if (cfg) {
-      await connect(ctx);
+      await connect(ctx); // 内部有网关选举门禁：非网关实例自动转工作模式
     } else {
       console.log(
         "[feishubot] 未配置，跳过连接（/feishubot-add 或 npm 脚本注册）",
@@ -1245,6 +1507,15 @@ export default function (pi: ExtensionAPI) {
     }
     requests.clear();
     activeRequest = null;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    try {
+      inboxWatcher?.close();
+    } catch {}
+    inboxWatcher = null;
+    // 注销实例注册 + 清空自己的信箱
+    rm(join(INSTANCES_DIR, `${SELF_PID}.json`)).catch(() => {});
+    rm(inboxDir(SELF_PID), { recursive: true, force: true }).catch(() => {});
     disconnect();
   });
 
