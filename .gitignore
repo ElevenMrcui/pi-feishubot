@@ -1,0 +1,11 @@
+node_modules/
+package-lock.json
+
+# 飞书凭据 — 严禁提交
+.pi/agent/feishu-bot/
+feishu-bot/
+config.json
+*.secret.*
+
+.DS_Store
+*.log

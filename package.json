@@ -1,0 +1,33 @@
+{
+  "name": "pi-feishubot",
+  "version": "1.0.0",
+  "description": "pi coding agent 飞书遥控扩展 — 飞书消息驱动 Pi，单卡片流式打字机、零 token 快捷指令、多会话切换（基于飞书官方 Channel SDK）",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "feishu",
+    "lark",
+    "larksuite",
+    "remote",
+    "bot",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "register": "node scripts/register.mjs"
+  },
+  "dependencies": {
+    "@larksuite/channel": "^0.7.1",
+    "qrcode": "^1.5.4"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
