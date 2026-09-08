@@ -837,6 +837,10 @@ export default function (pi: ExtensionAPI) {
     let resolveProducer!: () => void;
     const producer = (ctrl: any) => {
       req.streamCtrl = ctrl;
+      // 占位模式：拿到 ctrl 后立即写入"正在处理"占位文本（修复占位卡空白问题）
+      if (req.streamPlaceholder) {
+        void ctrl.setContent(req.streamPlaceholder).catch(() => {});
+      }
       // flush 循环：把 buffer 增量推给卡片
       req.streamFlushTimer = setInterval(async () => {
         if (req.finalized || !req.streamCtrl) return;
