@@ -22,6 +22,7 @@ import {
   chmod,
   unlink,
   open,
+  stat,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -307,14 +308,24 @@ export default function (pi: ExtensionAPI) {
    * 全量库实时检索，模糊匹配按最近修改优先。
    */
   async function resolveSessionTarget(arg: string): Promise<any | null> {
+    // 自由文本归一化：从任意输入中提取会话 ID（UUID）或其前缀，
+    // 兼容「绑定会话 会话 ID: 01a07c38-…」「切会话 id=01a07c38」等口语化输入
+    const uuidMatch = arg.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (uuidMatch) {
+      arg = uuidMatch[0];
+    } else {
+      // 无完整 UUID 时，提取 6-8 位 hex 片段（如 "01a07c38"）
+      const hexMatch = arg.match(/\b[0-9a-f]{6,8}\b/i);
+      if (hexMatch && !/^\d+$/.test(arg.trim())) {
+        arg = hexMatch[0];
+      }
+    }
     const idx = /^\d+$/.test(arg) ? parseInt(arg, 10) - 1 : -1;
     if (lastSessionList && idx >= 0 && idx < lastSessionList.length) {
       return lastSessionList[idx];
     }
     try {
-      const { SessionManager } = await import(
-        "@mariozechner/pi-coding-agent"
-      );
+      const { SessionManager } = await import("@mariozechner/pi-coding-agent");
       let all: any[] = [];
       try {
         all = await SessionManager.list(currentCtx?.cwd || process.cwd());
@@ -869,7 +880,9 @@ export default function (pi: ExtensionAPI) {
           (currentCtx as any)?.sessionManager?.sessionFile ||
           "";
         const lines = [`### 📋 最近会话 (共 ${lastSessionList.length} 个)`, ""];
-        lastSessionList.forEach((s: any, i: number) => {
+        let seq = 0;
+        for (const s of lastSessionList) {
+          const i = seq++;
           const d = new Date(s.modified);
           const Y = d.getFullYear();
           const M = String(d.getMonth() + 1).padStart(2, "0");
@@ -879,23 +892,33 @@ export default function (pi: ExtensionAPI) {
           const timeStr = `${Y}-${M}-${D} ${h}:${m}`;
           const title = s.name || s._displayName || s.id.slice(0, 8);
           const boundPath = chatBindings[req.chatId];
-          const curMark =
-            cur && s.path === cur ? "  *(当前会话)*" : "";
+          const curMark = cur && s.path === cur ? "  *(当前会话)*" : "";
           const bindMark =
             boundPath && s.path === boundPath ? "  📍已绑定" : "";
+          // 运行中判定：bot 自己所在会话一定运行中；其余看最近 5 分钟内有无写入
+          const ACTIVE_MS = 5 * 60 * 1000;
+          let mtimeMs = 0;
+          try {
+            mtimeMs = (await stat(s.path)).mtimeMs;
+          } catch {}
+          const activeMark =
+            (cur && s.path === cur) || Date.now() - mtimeMs < ACTIVE_MS
+              ? "  🟢运行中"
+              : "";
           lines.push(
             `${i + 1}. **${title}**${curMark}${bindMark}`,
             `   • 会话ID: \`${s.id}\``,
             `   • 最近操作: ${timeStr}`,
             "",
           );
-        });
+        }
         lines.push(
           "💡 **切换方式**：",
           "- 按序号：`切会话 1`",
           "- 按会话ID：`切会话 <会话ID>`（支持复制上方ID或前8位）",
           "- 按名称：`切会话 <名称关键词>`",
-          "- 长期固定：`绑定会话 <关键词>`（本聊天消息自动路由）",        );
+          "- 长期固定：`绑定会话 <关键词>`（本聊天消息自动路由）",
+        );
         await reply(lines.join("\n"));
       } catch (e: any) {
         await reply(`❌ 无法列出会话: ${e?.message || e}`);
@@ -923,11 +946,16 @@ export default function (pi: ExtensionAPI) {
       }
       const curFile = currentSessionFile();
       if (curFile && target.path === curFile) {
-        await reply(`○ 已在会话 **${target.name || target.id.slice(0, 8)}** 中，无需切换。`);
+        await reply(
+          `○ 已在会话 **${target.name || target.id.slice(0, 8)}** 中，无需切换。`,
+        );
         return true;
       }
       const targetName =
-        target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
+        target.name ||
+        target._displayName ||
+        target.firstMessage?.slice(0, 20) ||
+        target.id.slice(0, 8);
       try {
         await performSwitch(target.path);
         lastSessionList = [];
@@ -959,7 +987,10 @@ export default function (pi: ExtensionAPI) {
       chatBindings[req.chatId] = target.path;
       await saveBindings();
       const targetName =
-        target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
+        target.name ||
+        target._displayName ||
+        target.firstMessage?.slice(0, 20) ||
+        target.id.slice(0, 8);
       const curFile = currentSessionFile();
       const switchedNow =
         curFile && target.path !== curFile && currentCtx && currentCtx.isIdle();
@@ -973,7 +1004,9 @@ export default function (pi: ExtensionAPI) {
         [
           `📍 **已绑定路由**：本聊天 → 会话 **${targetName}**`,
           `- **会话ID**: \`${target.id}\``,
-          switchedNow ? `- 已立即切换过去，现在发消息直达该会话` : `- 之后发消息自动路由到该会话（任务执行中会暂缓路由）`,
+          switchedNow
+            ? `- 已立即切换过去，现在发消息直达该会话`
+            : `- 之后发消息自动路由到该会话（任务执行中会暂缓路由）`,
           `- 解除：发 \`解绑会话\``,
         ].join("\n"),
       );
