@@ -74,6 +74,8 @@ interface FeishuBotConfig {
 
 const CONFIG_DIR = join(homedir(), ".pi", "agent", "feishu-bot");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+/** 会话路由表：飞书 chatId → 绑定的 pi 会话文件绝对路径（持久化） */
+const BINDINGS_FILE = join(CONFIG_DIR, "bindings.json");
 
 async function loadConfig(): Promise<FeishuBotConfig | null> {
   try {
@@ -107,6 +109,10 @@ const FAST_COMMAND_RE =
 const MODEL_SWITCH_RE = /^(?:切换模型(?:到)?|\/model)\s+(.+)$/i;
 /** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
 const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
+/** 会话路由绑定：`绑定会话 <序号/ID/关键词>` —— 把当前飞书聊天固定路由到指定会话 */
+const SESSION_BIND_RE = /^(?:绑定会话|会话绑定|bind)\s+(.+)$/i;
+/** 解除绑定：`解绑会话` —— 恢复默认（消息进当前会话，不再自动路由） */
+const SESSION_UNBIND_RE = /^(?:解绑会话|unbind)$/i;
 
 function isFastCommandText(content: string): boolean {
   const s = content.trim();
@@ -114,7 +120,9 @@ function isFastCommandText(content: string): boolean {
   return (
     FAST_COMMAND_RE.test(s) ||
     MODEL_SWITCH_RE.test(s) ||
-    SESSION_SWITCH_RE.test(s)
+    SESSION_SWITCH_RE.test(s) ||
+    SESSION_BIND_RE.test(s) ||
+    SESSION_UNBIND_RE.test(s)
   );
 }
 
@@ -219,6 +227,7 @@ const PROMPT = `
 [feishubot] 飞书机器人已连接
 - 用户的消息来自飞书聊天窗口
 - 你的文本回复会在任务结束时【自动发送给飞书用户】，切勿在回答中再次调用任何发送工具重复发送
+- 不要主动切换、创建、恢复任何会话；会话管理完全由飞书扩展负责，用户提到切会话/换会话时回复提示其直接发送快捷指令
 - 请使用清晰规范的 Markdown 格式输出（支持标题、列表、代码块、粗体等）`;
 
 /** 单条飞书消息的处理上下文（v2 状态机） */
@@ -262,6 +271,97 @@ export default function (pi: ExtensionAPI) {
   const seenMessages = new Set<string>();
   // 已完成处理的飞书消息 ID，防止历史消息被重复处理或误触发兜底警告
   const finalizedMessageIds = new Set<string>();
+  // 会话路由表：chatId → 会话文件路径（持久化到 bindings.json）
+  let chatBindings: Record<string, string> = {};
+
+  /** 当前实例所处的会话文件路径 */
+  function currentSessionFile(): string {
+    const sm = (currentCtx as any)?.sessionManager;
+    if (!sm) return "";
+    return (
+      sm.sessionFile ||
+      sm.sessionPath ||
+      (typeof sm.getSessionFile === "function" ? sm.getSessionFile() : "") ||
+      ""
+    );
+  }
+
+  async function loadBindings() {
+    try {
+      chatBindings = JSON.parse(await readFile(BINDINGS_FILE, "utf8"));
+    } catch {
+      chatBindings = {};
+    }
+  }
+
+  async function saveBindings() {
+    if (!existsSync(CONFIG_DIR)) {
+      await mkdir(CONFIG_DIR, { recursive: true });
+      await chmod(CONFIG_DIR, 0o700).catch(() => {});
+    }
+    await writeFile(BINDINGS_FILE, JSON.stringify(chatBindings, null, 2));
+  }
+
+  /**
+   * 解析会话目标：序号（最近列表）→ 精确 ID → ID 前缀（≥6 位）→ 名称 → 首条消息关键词。
+   * 全量库实时检索，模糊匹配按最近修改优先。
+   */
+  async function resolveSessionTarget(arg: string): Promise<any | null> {
+    const idx = /^\d+$/.test(arg) ? parseInt(arg, 10) - 1 : -1;
+    if (lastSessionList && idx >= 0 && idx < lastSessionList.length) {
+      return lastSessionList[idx];
+    }
+    try {
+      const { SessionManager } = await import(
+        "@mariozechner/pi-coding-agent"
+      );
+      let all: any[] = [];
+      try {
+        all = await SessionManager.list(currentCtx?.cwd || process.cwd());
+      } catch {}
+      if (!all || all.length === 0) {
+        all = await SessionManager.listAll();
+      }
+      all.sort(
+        (a: any, b: any) => +new Date(b.modified) - +new Date(a.modified),
+      );
+      const q = arg.toLowerCase();
+      return (
+        all.find((s: any) => s.id.toLowerCase() === q) ||
+        (q.length >= 6
+          ? all.find((s: any) => s.id.toLowerCase().startsWith(q))
+          : undefined) ||
+        all.find((s: any) => (s.name || "").toLowerCase().includes(q)) ||
+        all.find((s: any) =>
+          (s.firstMessage || "").toLowerCase().includes(q),
+        ) ||
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 切换会话（唯一合法入口）：优先直调，必要时走命令通道，
+   * 并在完成后校验会话是否真的切换（防止命令文本泄入 LLM 造成意外行为）。
+   */
+  async function performSwitch(targetPath: string) {
+    if (typeof (currentCtx as any)?.switchSession === "function") {
+      await (currentCtx as any).switchSession(targetPath);
+      return;
+    }
+    await pi.sendUserMessage(
+      [{ type: "text", text: `/feishubot-switch-session ${targetPath}` }],
+      { expandPromptTemplates: true } as any,
+    );
+    // 校验：命令通道必须真正生效，否则抛错（绝不把 / 命令文本留给 LLM 发挥）
+    await sleep(800);
+    const cur = currentSessionFile();
+    if (cur && cur !== targetPath) {
+      throw new Error("会话切换未生效（命令通道未响应，已拦截）");
+    }
+  }
 
   // ========================================================================
   // 连接
@@ -569,7 +669,9 @@ export default function (pi: ExtensionAPI) {
           "",
           "**会话管理**",
           "- `会话` / `sessions` — 列出最近会话",
-          "- `切会话 <序号>` — 切换到指定会话",
+          "- `切会话 <序号/ID/名称>` — 切换到指定会话",
+          "- `绑定会话 <关键词>` — 本聊天固定路由到该会话",
+          "- `解绑会话` — 解除路由绑定",
           "- `新会话` / `/new` — 重置会话上下文",
           "",
           "**模型管理**",
@@ -776,9 +878,13 @@ export default function (pi: ExtensionAPI) {
           const m = String(d.getMinutes()).padStart(2, "0");
           const timeStr = `${Y}-${M}-${D} ${h}:${m}`;
           const title = s.name || s._displayName || s.id.slice(0, 8);
-          const curMark = cur && s.path === cur ? "  *(当前会话)*" : "";
+          const boundPath = chatBindings[req.chatId];
+          const curMark =
+            cur && s.path === cur ? "  *(当前会话)*" : "";
+          const bindMark =
+            boundPath && s.path === boundPath ? "  📍已绑定" : "";
           lines.push(
-            `${i + 1}. **${title}**${curMark}`,
+            `${i + 1}. **${title}**${curMark}${bindMark}`,
             `   • 会话ID: \`${s.id}\``,
             `   • 最近操作: ${timeStr}`,
             "",
@@ -789,7 +895,7 @@ export default function (pi: ExtensionAPI) {
           "- 按序号：`切会话 1`",
           "- 按会话ID：`切会话 <会话ID>`（支持复制上方ID或前8位）",
           "- 按名称：`切会话 <名称关键词>`",
-        );
+          "- 长期固定：`绑定会话 <关键词>`（本聊天消息自动路由）",        );
         await reply(lines.join("\n"));
       } catch (e: any) {
         await reply(`❌ 无法列出会话: ${e?.message || e}`);
@@ -798,96 +904,95 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 【切换会话】`切会话 <序号/会话ID/名称>` / `/session <id>`
+    // 安全约束：任务执行中禁止切换（防止任务中断/会话意外漂移）；目标==当前时短路
     const swSession = text.trim().match(SESSION_SWITCH_RE);
     if (swSession) {
       const arg = swSession[1].trim();
-      const idx = /^\d+$/.test(arg) ? parseInt(arg, 10) - 1 : -1;
-      let target: any = null;
-
-      // 1. 优先从最近查看的列表中取序号
-      if (lastSessionList && idx >= 0 && idx < lastSessionList.length) {
-        target = lastSessionList[idx];
+      if (currentCtx && !currentCtx.isIdle()) {
+        await reply(
+          "⏳ 当前有任务执行中，禁止切换会话（防止任务中断）。可先发 `停止` 中止后再切。",
+        );
+        return true;
       }
-
-      // 2. 若未通过序号命中，实时从 SessionManager 搜索（支持按 ID 完全匹配、ID 前缀匹配、名称匹配）
+      const target = await resolveSessionTarget(arg);
       if (!target) {
-        try {
-          const { SessionManager } = await import(
-            "@mariozechner/pi-coding-agent"
-          );
-          let allSessions: any[] = [];
-          try {
-            allSessions = await SessionManager.list(
-              currentCtx?.cwd || process.cwd(),
-            );
-          } catch {}
-          if (!allSessions || allSessions.length === 0) {
-            allSessions = await SessionManager.listAll();
-          }
-          const q = arg.toLowerCase();
-          // A. 精确 ID 匹配
-          target = allSessions.find((s: any) => s.id.toLowerCase() === q);
-          // B. ID 前缀匹配（输入长度 >= 6 位即可）
-          if (!target && q.length >= 6) {
-            target = allSessions.find((s: any) =>
-              s.id.toLowerCase().startsWith(q),
-            );
-          }
-          // C. 会话名称匹配
-          if (!target) {
-            target = allSessions.find((s: any) =>
-              (s.name || "").toLowerCase().includes(q),
-            );
-          }
-          // D. 首条消息匹配
-          if (!target) {
-            target = allSessions.find((s: any) =>
-              (s.firstMessage || "").toLowerCase().includes(q),
-            );
-          }
-        } catch {}
-      }
-
-      if (target) {
-        const targetName =
-          target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
-        try {
-          if (typeof (currentCtx as any)?.switchSession === "function") {
-            await (currentCtx as any).switchSession(target.path);
-          } else {
-            // 通过扩展命令分发通道触发，注入 CommandContext 执行 switchSession，零 token
-            await pi.sendUserMessage(
-              [
-                {
-                  type: "text",
-                  text: `/feishubot-switch-session ${target.path}`,
-                },
-              ],
-              { expandPromptTemplates: true } as any,
-            );
-          }
-          lastSessionList = [];
-          const d = new Date(target.modified);
-          const timeStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-          await reply(
-            [
-              `✅ **已成功切换到会话**`,
-              `- **名称**: ${targetName}`,
-              `- **会话ID**: \`${target.id}\``,
-              `- **最近操作**: ${timeStr}`,
-            ].join("\n"),
-          );
-        } catch (e: any) {
-          await reply(`❌ 切换失败: ${e?.message || e}`);
-        }
-      } else {
         await reply(
           `❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看最近列表，或提供完整的会话ID。`,
         );
+        return true;
+      }
+      const curFile = currentSessionFile();
+      if (curFile && target.path === curFile) {
+        await reply(`○ 已在会话 **${target.name || target.id.slice(0, 8)}** 中，无需切换。`);
+        return true;
+      }
+      const targetName =
+        target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
+      try {
+        await performSwitch(target.path);
+        lastSessionList = [];
+        const d = new Date(target.modified);
+        const timeStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+        await reply(
+          [
+            `✅ **已成功切换到会话**`,
+            `- **名称**: ${targetName}`,
+            `- **会话ID**: \`${target.id}\``,
+            `- **最近操作**: ${timeStr}`,
+          ].join("\n"),
+        );
+      } catch (e: any) {
+        await reply(`❌ 切换失败: ${e?.message || e}`);
       }
       return true;
     }
 
+    // 【绑定会话】`绑定会话 <序号/ID/关键词>` —— 当前飞书聊天固定路由到该会话
+    const bindSession = text.trim().match(SESSION_BIND_RE);
+    if (bindSession) {
+      const arg = bindSession[1].trim();
+      const target = await resolveSessionTarget(arg);
+      if (!target) {
+        await reply(`❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看列表。`);
+        return true;
+      }
+      chatBindings[req.chatId] = target.path;
+      await saveBindings();
+      const targetName =
+        target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
+      const curFile = currentSessionFile();
+      const switchedNow =
+        curFile && target.path !== curFile && currentCtx && currentCtx.isIdle();
+      if (switchedNow) {
+        try {
+          await performSwitch(target.path);
+          lastSessionList = [];
+        } catch {}
+      }
+      await reply(
+        [
+          `📍 **已绑定路由**：本聊天 → 会话 **${targetName}**`,
+          `- **会话ID**: \`${target.id}\``,
+          switchedNow ? `- 已立即切换过去，现在发消息直达该会话` : `- 之后发消息自动路由到该会话（任务执行中会暂缓路由）`,
+          `- 解除：发 \`解绑会话\``,
+        ].join("\n"),
+      );
+      return true;
+    }
+
+    // 【解绑会话】恢复默认路由
+    if (SESSION_UNBIND_RE.test(text.trim())) {
+      if (chatBindings[req.chatId]) {
+        delete chatBindings[req.chatId];
+        await saveBindings();
+        await reply("🔓 已解除本聊天的会话绑定，消息恢复进入当前所处会话。");
+      } else {
+        await reply("○ 本聊天没有绑定会话。");
+      }
+      return true;
+    }
+
+    return false;
     return false;
   }
 
@@ -935,6 +1040,25 @@ export default function (pi: ExtensionAPI) {
     if (isFastCommandText(text)) {
       const handled = await handleFastCommand(req, text);
       if (handled) return;
+    }
+
+    // 【会话路由】绑定表优先：本聊天绑定了会话且不是当前所处会话 → 自动路由过去
+    const boundPath = chatBindings[req.chatId];
+    if (boundPath && boundPath !== currentSessionFile()) {
+      if (currentCtx && !currentCtx.isIdle()) {
+        // 任务执行中绝不切换（保住正在跑的任务），给出明确提示
+        await replyMarkdown(
+          req,
+          "⏳ 当前有任务执行中，本消息暂未路由到绑定会话。任务完成或发 `停止` 后重发即可。",
+        );
+        return;
+      }
+      try {
+        await performSwitch(boundPath);
+      } catch (e: any) {
+        await replyMarkdown(req, `❌ 路由到绑定会话失败: ${e?.message || e}`);
+        return;
+      }
     }
 
     // 记录请求 + 注入 pi
@@ -1070,6 +1194,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => {
     currentCtx = ctx;
     if (!SDK) return;
+    await loadBindings();
     const cfg = await loadConfig();
     if (cfg) {
       await connect(ctx);
