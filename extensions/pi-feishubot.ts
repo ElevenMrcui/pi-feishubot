@@ -126,6 +126,8 @@ const SESSION_UNBIND_RE = /^(?:解绑会话|unbind)$/i;
 function isFastCommandText(content: string): boolean {
   const s = content.trim();
   if (!s) return false;
+  // reload 常见错拼容错（rwload/relaod/rewload…）
+  if (/^\/?reload(es|ed|s?)$|^\/?rwload$|^\/?relaod$|^\/?rewload$|^\/?relode$/i.test(s)) return true;
   return (
     FAST_COMMAND_RE.test(s) ||
     MODEL_SWITCH_RE.test(s) ||
@@ -1137,8 +1139,12 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
-    // 【重载扩展】reload / 重载 / /reload —— 重载收到消息的这个 pi 实例
-    if (lower === "reload" || lower === "重载" || lower === "/reload") {
+    // 【重载扩展】reload / 重载 / /reload（含常见错拼 rwload/relaod 等）—— 重载收到消息的这个 pi 实例
+    if (
+      lower === "重载" ||
+      lower === "/reload" ||
+      /^\/?(reload(es|ed|s?)|rwload|relaod|rewload|relode)$/.test(lower)
+    ) {
       await reply("🔄 收到，正在重载当前 pi 实例的扩展与配置…");
       // 让回执先送达，再异步触发（reload 会 invalidate 当前扩展上下文）
       setTimeout(async () => {
