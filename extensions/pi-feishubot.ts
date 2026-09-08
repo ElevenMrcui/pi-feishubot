@@ -766,17 +766,30 @@ export default function (pi: ExtensionAPI) {
           (currentCtx as any)?.sessionManager?.sessionPath ||
           (currentCtx as any)?.sessionManager?.sessionFile ||
           "";
-        const lines = ["### 📂 最近会话", ""];
+        const lines = [`### 📋 最近会话 (共 ${lastSessionList.length} 个)`, ""];
         lastSessionList.forEach((s: any, i: number) => {
           const d = new Date(s.modified);
-          const t = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-          const dir = s.cwd ? s.cwd.split("/").filter(Boolean).pop() : "";
-          const curMark = cur && s.path === cur ? " ←当前" : "";
+          const Y = d.getFullYear();
+          const M = String(d.getMonth() + 1).padStart(2, "0");
+          const D = String(d.getDate()).padStart(2, "0");
+          const h = String(d.getHours()).padStart(2, "0");
+          const m = String(d.getMinutes()).padStart(2, "0");
+          const timeStr = `${Y}-${M}-${D} ${h}:${m}`;
+          const title = s.name || s._displayName || s.id.slice(0, 8);
+          const curMark = cur && s.path === cur ? "  *(当前会话)*" : "";
           lines.push(
-            `${i + 1}. **${s.name || s._displayName || s.id.slice(0, 8)}** · ${t}${dir ? ` · ${dir}` : ""}${curMark}`,
+            `${i + 1}. **${title}**${curMark}`,
+            `   • 会话ID: \`${s.id}\``,
+            `   • 最近操作: ${timeStr}`,
+            "",
           );
         });
-        lines.push("", "切换: `切会话 <序号>`");
+        lines.push(
+          "💡 **切换方式**：",
+          "- 按序号：`切会话 1`",
+          "- 按会话ID：`切会话 <会话ID>`（支持复制上方ID或前8位）",
+          "- 按名称：`切会话 <名称关键词>`",
+        );
         await reply(lines.join("\n"));
       } catch (e: any) {
         await reply(`❌ 无法列出会话: ${e?.message || e}`);
@@ -784,46 +797,93 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
-    // 【切换会话】`切会话 <序号>`
+    // 【切换会话】`切会话 <序号/会话ID/名称>` / `/session <id>`
     const swSession = text.trim().match(SESSION_SWITCH_RE);
     if (swSession) {
       const arg = swSession[1].trim();
       const idx = /^\d+$/.test(arg) ? parseInt(arg, 10) - 1 : -1;
       let target: any = null;
+
+      // 1. 优先从最近查看的列表中取序号
       if (lastSessionList && idx >= 0 && idx < lastSessionList.length) {
         target = lastSessionList[idx];
-      } else if (!/^\d+$/.test(arg)) {
-        // 支持按会话名/id 片段模糊匹配
-        const q = arg.toLowerCase();
-        target = (lastSessionList || []).find(
-          (s: any) =>
-            (s.name || "").toLowerCase().includes(q) ||
-            (s._displayName || "").toLowerCase().includes(q) ||
-            s.id.toLowerCase().includes(q),
-        );
       }
+
+      // 2. 若未通过序号命中，实时从 SessionManager 搜索（支持按 ID 完全匹配、ID 前缀匹配、名称匹配）
       if (!target) {
-        await reply(
-          "❌ 未找到目标会话。先发 `会话` 查看列表（序号 10 分钟内有效）。",
-        );
-      } else {
+        try {
+          const { SessionManager } = await import(
+            "@mariozechner/pi-coding-agent"
+          );
+          let allSessions: any[] = [];
+          try {
+            allSessions = await SessionManager.list(
+              currentCtx?.cwd || process.cwd(),
+            );
+          } catch {}
+          if (!allSessions || allSessions.length === 0) {
+            allSessions = await SessionManager.listAll();
+          }
+          const q = arg.toLowerCase();
+          // A. 精确 ID 匹配
+          target = allSessions.find((s: any) => s.id.toLowerCase() === q);
+          // B. ID 前缀匹配（输入长度 >= 6 位即可）
+          if (!target && q.length >= 6) {
+            target = allSessions.find((s: any) =>
+              s.id.toLowerCase().startsWith(q),
+            );
+          }
+          // C. 会话名称匹配
+          if (!target) {
+            target = allSessions.find((s: any) =>
+              (s.name || "").toLowerCase().includes(q),
+            );
+          }
+          // D. 首条消息匹配
+          if (!target) {
+            target = allSessions.find((s: any) =>
+              (s.firstMessage || "").toLowerCase().includes(q),
+            );
+          }
+        } catch {}
+      }
+
+      if (target) {
         const targetName =
-          target.name || target._displayName || target.id.slice(0, 8);
+          target.name || target._displayName || target.firstMessage?.slice(0, 20) || target.id.slice(0, 8);
         try {
           if (typeof (currentCtx as any)?.switchSession === "function") {
             await (currentCtx as any).switchSession(target.path);
           } else {
             // 通过扩展命令分发通道触发，注入 CommandContext 执行 switchSession，零 token
             await pi.sendUserMessage(
-              [{ type: "text", text: `/feishubot-switch-session ${target.path}` }],
+              [
+                {
+                  type: "text",
+                  text: `/feishubot-switch-session ${target.path}`,
+                },
+              ],
               { expandPromptTemplates: true } as any,
             );
           }
           lastSessionList = [];
-          await reply(`✅ 已成功切换到会话：**${targetName}**`);
+          const d = new Date(target.modified);
+          const timeStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+          await reply(
+            [
+              `✅ **已成功切换到会话**`,
+              `- **名称**: ${targetName}`,
+              `- **会话ID**: \`${target.id}\``,
+              `- **最近操作**: ${timeStr}`,
+            ].join("\n"),
+          );
         } catch (e: any) {
           await reply(`❌ 切换失败: ${e?.message || e}`);
         }
+      } else {
+        await reply(
+          `❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看最近列表，或提供完整的会话ID。`,
+        );
       }
       return true;
     }
