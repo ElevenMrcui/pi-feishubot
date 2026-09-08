@@ -809,7 +809,9 @@ export default function (pi: ExtensionAPI) {
           await reply(`❌ 切换失败: ${e?.message || e}`);
         }
       } else {
-        await reply("❌ 当前环境不支持切换会话。");
+        await reply(
+          "⚠️ 远程环境限制：会话热切换为 pi 终端专属指令（受引擎沙箱保护，无法从后台远程强切）。建议在本地终端按需切换，或直接在此会话发送新需求。",
+        );
       }
       return true;
     }
