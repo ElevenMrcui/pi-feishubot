@@ -295,6 +295,7 @@ export default function (pi: ExtensionAPI) {
   let isGateway = false;
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let inboxWatcher: FSWatcher | null = null;
+  let outboxWatcher: FSWatcher | null = null;
   const startedAt = Date.now();
 
   /** 当前实例所处的会话文件路径 */
@@ -543,8 +544,22 @@ export default function (pi: ExtensionAPI) {
     } catch (e: any) {
       console.error("[feishubot] inbox watch 失败:", e?.message);
     }
+    // 网关：监听自己的 outbox（工作实例委托的回复）→ 秒级代发
+    const outDir = join(INBOX_ROOT, String(SELF_PID), "outbox");
+    if (!existsSync(outDir)) {
+      mkdir(outDir, { recursive: true }).catch(() => {});
+    }
+    try {
+      outboxWatcher?.close();
+    } catch {}
+    try {
+      outboxWatcher = fsWatch(outDir, () => void drainOutbox());
+    } catch (e: any) {
+      console.error("[feishubot] outbox watch 失败:", e?.message);
+    }
     // 启动时处理残留（上次崩溃/退出未消费的）
     void drainInbox();
+    if (isGateway && channel) void drainOutbox();
   }
 
   /** 启动心跳：注册续约 + 网关重选（原网关死亡时自动顶上接管 WS） */
@@ -777,7 +792,19 @@ export default function (pi: ExtensionAPI) {
   // ========================================================================
 
   async function replyMarkdown(req: FeishuRequest, md: string) {
-    if (!channel) return;
+    if (!channel) {
+      // 工作实例（无 WS）：委托网关代发本聊天回复（修复多实例路由无回复）
+      const live = await listLiveInstances();
+      const gw = electGateway(live);
+      if (gw && gw.pid !== SELF_PID) {
+        for (const part of splitLongMarkdown(md)) {
+          await delegateSend(gw.pid, req.chatId, part);
+        }
+      } else {
+        console.error("[feishubot] 回复无法送达：无 WS 且无存活网关");
+      }
+      return;
+    }
     const chunks = splitLongMarkdown(md);
     const target = {
       chatId: req.chatId,
@@ -1695,6 +1722,10 @@ export default function (pi: ExtensionAPI) {
       inboxWatcher?.close();
     } catch {}
     inboxWatcher = null;
+    try {
+      outboxWatcher?.close();
+    } catch {}
+    outboxWatcher = null;
     // 注销实例注册 + 清空自己的信箱
     rm(join(INSTANCES_DIR, `${SELF_PID}.json`)).catch(() => {});
     rm(inboxDir(SELF_PID), { recursive: true, force: true }).catch(() => {});
