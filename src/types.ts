@@ -118,6 +118,8 @@ export interface BotServices {
 export interface BotRuntime {
  // ---- 连接状态 ----
  channel: any | null;
+ /** 仅发送通道（无 WS）：工作实例的回复直发，不依赖网关代发 */
+ sendOnlyChannel: any | null;
  connected: boolean;
  currentCtx: any | null; // ExtensionContext（宽松契约，见文件头说明）
  botName: string;

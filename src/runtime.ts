@@ -15,6 +15,7 @@ export function createRuntime(): BotRuntime {
   return {
     // 连接状态
     channel: null,
+    sendOnlyChannel: null,
     connected: false,
     currentCtx: null,
     botName: "Pi",
