@@ -1803,9 +1803,19 @@ export default function (pi: ExtensionAPI) {
       finalized: false,
     };
 
-    // 快捷指令：零 token 秒回
+    // 快捷指令：零 token 秒回（带统一异常兜底：指令失败必回执）
     if (isFastCommandText(text)) {
-      const handled = await handleFastCommand(req, text);
+      let handled = false;
+      try {
+        handled = await handleFastCommand(req, text);
+      } catch (e: any) {
+        console.error("[feishubot] 指令执行异常:", e?.message || e);
+        await replyMarkdown(
+          req,
+          `❌ 指令执行失败: ${e?.message || e}`,
+        );
+        return;
+      }
       if (handled) {
         // 顺带消费 outbox（降低工作实例委托回复的延迟）
         if (isGateway && channel) await drainOutbox();
