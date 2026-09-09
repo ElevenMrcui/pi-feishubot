@@ -181,11 +181,13 @@ export async function drainOutbox(rt: BotRuntime) {
   }
 }
 
-export function startInboxWatcher(rt: BotRuntime) {
+/**
+ * 挂载信箱监听（async：目录就绪后再 fsWatch，修复新实例首启的 ENOENT 竞态 ——
+ * 原实现 mkdir 异步发射后不管，fsWatch 同步执行时目录尚未存在）
+ */
+export async function startInboxWatcher(rt: BotRuntime) {
   const dir = inboxDir(rt, rt.SELF_PID);
-  if (!existsSync(dir)) {
-    mkdir(dir, { recursive: true }).catch(() => {});
-  }
+  await mkdir(dir, { recursive: true });
   try {
     rt.inboxWatcher?.close();
   } catch (e) {
@@ -198,9 +200,7 @@ export function startInboxWatcher(rt: BotRuntime) {
   }
   // 网关：监听自己的 outbox（工作实例委托的回复）→ 秒级代发
   const outDir = join(INBOX_ROOT, String(rt.SELF_PID), "outbox");
-  if (!existsSync(outDir)) {
-    mkdir(outDir, { recursive: true }).catch(() => {});
-  }
+  await mkdir(outDir, { recursive: true });
   try {
     rt.outboxWatcher?.close();
   } catch (e) {

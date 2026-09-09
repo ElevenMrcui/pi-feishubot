@@ -204,7 +204,10 @@ export function createBindSessionCommand(rt: BotRuntime): FastCommand {
         return true;
       }
       rt.chatBindings[req.chatId] = target.path;
-      await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
+      await saveBindings({
+        chats: rt.chatBindings,
+        senders: rt.senderBindings,
+      });
       const targetName =
         target.name ||
         target._displayName ||
@@ -273,12 +276,19 @@ export function createBindMeCommand(rt: BotRuntime): FastCommand {
       const arg = bindMe[1].trim();
       const target = await resolveSessionTarget(rt, arg);
       if (!target) {
-        await replyMarkdown(rt, req, `❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看列表。`);
+        await replyMarkdown(
+          rt,
+          req,
+          `❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看列表。`,
+        );
         return true;
       }
       const senderKey = `${req.chatId}|${req.senderId || ""}`;
       rt.senderBindings[senderKey] = target.path;
-      await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
+      await saveBindings({
+        chats: rt.chatBindings,
+        senders: rt.senderBindings,
+      });
       const targetName =
         target.name ||
         target._displayName ||
@@ -316,8 +326,15 @@ export function createUnbindMeCommand(rt: BotRuntime): FastCommand {
       const senderKey = `${req.chatId}|${req.senderId || ""}`;
       if (rt.senderBindings[senderKey]) {
         delete rt.senderBindings[senderKey];
-        await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
-        await replyMarkdown(rt, req, "🔓 已解除你的发送方级绑定，恢复聊天级/默认路由。");
+        await saveBindings({
+          chats: rt.chatBindings,
+          senders: rt.senderBindings,
+        });
+        await replyMarkdown(
+          rt,
+          req,
+          "🔓 已解除你的发送方级绑定，恢复聊天级/默认路由。",
+        );
       } else {
         await replyMarkdown(rt, req, "○ 你在本聊天没有发送方级绑定。");
       }

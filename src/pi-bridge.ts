@@ -83,7 +83,7 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     // 实例注册 + 心跳（多实例自动入网；新实例启动即出现在 实例 列表）
     await writeInstanceHeartbeat(rt);
     startHeartbeat(rt, ctx, pi);
-    startInboxWatcher(rt);
+    await startInboxWatcher(rt);
     await drainInbox(rt, pi);
     const cfg = await loadConfig();
     if (cfg) {
