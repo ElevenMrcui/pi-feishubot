@@ -1,6 +1,6 @@
 {
   "name": "pi-feishubot",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "飞书官方 Channel SDK 接入扩展 for pi coding agent — WebSocket 长连接 / 流式打字机卡片 / 多实例网关路由",
   "main": "src/main.ts",
   "scripts": {
