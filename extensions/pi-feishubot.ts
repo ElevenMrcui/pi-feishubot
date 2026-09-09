@@ -863,7 +863,7 @@ export default function (pi: ExtensionAPI) {
       if (req.finalized || req.phase !== "thinking" || req.streamCtrl) return;
       ensureStream(req, ACK_PLACEHOLDER);
       // 占位期心跳：每 10s 更新"仍在运行"，让用户确认没有失踪
-      const started = Date.now();
+      const started = req.startedAtMs || Date.now();
       req.aliveTimer = setInterval(async () => {
         if (req.finalized || req.phase !== "thinking" || !req.streamCtrl) {
           if (req.aliveTimer) {
@@ -874,7 +874,7 @@ export default function (pi: ExtensionAPI) {
         }
         const sec = Math.round((Date.now() - started) / 1000);
         try {
-          await req.streamCtrl.setContent(`🫥 仍在运行… ${sec}s`);
+          await req.streamCtrl.setContent(`🫥 仍在运行… 累计 ${sec}s`);
         } catch {}
       }, 10_000);
     }, ACK_DELAY_MS);
@@ -901,17 +901,20 @@ export default function (pi: ExtensionAPI) {
       req.streamFlushTimer = setInterval(async () => {
         if (req.finalized || !req.streamCtrl) return;
         const buf = req.streamBuffer;
-        // 运行心跳：流式静默超过 15s（长工具期）→ 追加一行可见的存活提示
-        // （finalize 时 setContent 全文覆盖，心跳行不会留在最终结果里）
-        const silentMs = Date.now() - (req.lastActivityAt || req.startedAtMs || Date.now());
+        // 运行心跳：静默超过 15s → 用 setContent 原地更新"已运行 Ns"（同一行，不堆积）；
+        // finalize 时 setContent 全文覆盖，心跳行不会留在最终结果里
+        const activityBase = req.lastActivityAt || req.startedAtMs || Date.now();
+        const silentMs = Date.now() - activityBase;
+        const runSec = Math.round((Date.now() - (req.startedAtMs || activityBase)) / 1000);
         if (
           buf.length === req.streamAppended &&
           req.streamAppended > 0 &&
           silentMs > 15_000
         ) {
-          const sec = Math.round(silentMs / 1000);
           try {
-            await req.streamCtrl.append(`\n\n⏱ 仍在执行，已 ${sec}s…`);
+            await req.streamCtrl.setContent(
+              `${buf}\n\n⏱ 仍在执行，累计 ${runSec}s…`,
+            );
             req.lastActivityAt = Date.now();
           } catch {}
           return;
