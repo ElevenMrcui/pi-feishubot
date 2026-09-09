@@ -1,241 +1,66 @@
 # pi-feishubot
 
-**pi coding agent 的飞书遥控扩展** — 把 [pi](https://github.com/earendil-works/pi-coding-agent) 装进飞书：在飞书聊天窗口发消息驱动 AI 编码助手，流式查看执行进度，多会话并行路由，随时切模型、叫停任务。
+飞书官方 [Channel SDK](https://open.feishu.cn/document/mcp_open_tools/integrating-agents-with-feishu/integrate-feishu-channel)（`@larksuite/channel`）接入扩展，让 [pi coding agent](https://github.com/earendil-works/pi-coding-agent) 通过飞书聊天远程驱动。
 
-基于[飞书官方 Channel SDK](https://open.feishu.cn/document/mcp_open_tools/integrating-agents-with-feishu/integrate-feishu-channel)（`@larksuite/channel`）的 WebSocket 长连接，无需公网服务器、无需 Webhook 回调 —— pi 会话开着，机器人就在线。
+## 特性
 
-## ✨ 特性
+- **WebSocket 长连接**：无需公网回调地址；SDK 内置重连 / 心跳 / 去重 / @ 策略 / chat 串行
+- **流式打字机卡片**：token 级 `text_delta` → 飞书卡片实时逐字刷新；静默 >15s 原地显示"仍在执行 Ns"
+- **零 Token 快捷指令**：`状态` / `停止` / `列出模型` / `切换模型到 X` / `重载` 等秒回，不消耗 LLM
+- **多实例网关路由**：多个 pi 会话共存时，磁盘锁仲裁单 WS 网关，消息按**绑定表**路由到承载目标会话的实例；`@标签` 单条临时路由；回复经 outbox 委托网关代发（含死信落盘）
+- **登录目录模型解析**：按 auth.json 已登录 provider + bai 账号目录精确过滤，表格展示（✅ 标当前）
 
-- **真·流式打字机**：token 级增量推送到**单张**飞书卡片实时刷新，结束定格全文（不是多条刷屏消息）
-- **多实例会话路由**（v1.1.0）：多个 pi 实例各守各的会话，飞书消息按聊天绑定**自动路由到正确实例**执行，互不干扰、回传结果到原聊天
-- **零 token 快捷指令**：帮助 / 状态 / 停止 / 实例 / 模型查看与切换 / 会话列表 / 绑定路由，全部在扩展层秒回，不消耗 LLM token
-- **会话管理**：`会话` 列出最近会话（中文名 + 完整会话ID + 最近操作时间 + 🟢运行中标记），支持按 **序号 / 会话ID / 名称关键词** 切换
-- **模型管理**：`当前模型` / `列出模型` / `切换模型到 <名称>`，切换即写回默认配置
-- **实例查询**：`实例` 查看所有运行中的 pi 实例（PID / 会话 / 运行时长 / 网关角色）
-- **长文安全**：超长回复自动按段落分段（28000 字符/段），卡片失败自动降级纯文本
-- **防打扰**：任务执行期间**零中间进度消息**，只有一张流式卡片
-- **稳定连接**：WS 保活看门狗、自动重连、消息去重、群聊 @提及门控、发送者真名解析
-- **零凭据硬编码**：App 凭据本地存储（`chmod 600`），支持扫码注册或命令行录入
+## 架构（设计模式）
 
-## 📦 安装
+```text
+src/
+├── types.ts           类型契约（BotRuntime / FastCommand / RouteHandler）
+├── runtime.ts         Singleton：共享状态容器
+├── utils.ts           纯函数工具
+├── storage.ts         Repository：config / bindings / auth / bai 目录 / settings
+├── instances.ts       Registry：实例注册表 + 心跳 + 网关选举
+├── gateway-lock.ts    磁盘仲裁锁（单写者：飞书 WS 持有权）
+├── mailbox.ts         Mediator：inbox/outbox 跨实例投递
+├── sender.ts          Facade：出站发送（分段 / 降级 / 委托网关 / 死信）
+├── streaming.ts       State：thinking→streaming→done 打字机状态机
+├── model-resolver.ts  Strategy：登录目录模型解析
+├── session-control.ts 会话解析 / 切换 / Ghostty 实例生命周期
+├── sdk.ts             @larksuite/channel 加载器
+├── routing.ts         Chain of Responsibility：@标签 → 绑定表 → 本地指令
+├── message-handler.ts 入站编排
+├── channel-gateway.ts Facade：连接 / 退避重试 / 心跳接管
+├── pi-bridge.ts       Observer：pi 事件桥 + agent_end 回复配对
+├── commands/          Command：16 个快捷指令 + Registry
+└── main.ts            Composition Root
+```
+
+## 安装
 
 ```bash
-# 方式一：git 安装（推荐）
-pi install git:github.com/ElevenMrcui/pi-feishubot@v1.1.0
+# 1. 依赖
+npm install
 
-# 方式二：URL 安装
-pi install https://github.com/ElevenMrcui/pi-feishubot
+# 2. 扫码注册飞书应用（凭据自动写入 ~/.pi/agent/feishu-bot/config.json）
+node register.mjs
+
+# 3. 扩展入口（软链或复制到 pi 扩展目录）
+cp entry/pi-feishubot.ts ~/.pi/agent/extensions/
+# 或
+ln -s "$(pwd)/entry/pi-feishubot.ts" ~/.pi/agent/extensions/pi-feishubot.ts
 ```
 
-pi 会自动拉取仓库并执行 `npm install`（含飞书 SDK）。
+重启 pi / `/reload` 后自动连接。单聊直接发消息；群聊 `@机器人 + 消息`。
 
-### 从源码安装
+## 快捷指令
 
-```bash
-git clone https://github.com/ElevenMrcui/pi-feishubot.git
-cd pi-feishubot && npm install
-pi -e ./extensions/pi-feishubot.ts   # 或复制到 ~/.pi/agent/extensions/
-```
+| 分类 | 指令 |
+| --- | --- |
+| 状态 | `状态` `/status` · `停止` `/stop` |
+| 模型 | `当前模型` · `列出模型` / `全部模型` · `切换模型到 <名称>` |
+| 会话 | `会话` · `切会话 <序号/ID/关键词>` · `绑定会话` / `解绑会话` |
+| 实例 | `实例` · `@<标签> <消息>` · `启动实例 <目录> [恢复]` · `恢复会话 <关键词>` · `关闭实例 <pid>` |
+| 其他 | `帮助` · `新会话` · `重载` |
 
-## 🔑 配置飞书应用（二选一）
-
-### 方式 A：扫码自动注册（推荐）
-
-```bash
-cd ~/.pi/agent/npm/node_modules/pi-feishubot   # pi 包安装位置
-npm run register                                # 或 node scripts/register.mjs
-```
-
-终端会显示二维码 → 用**飞书 App** 扫码确认 → 自动创建应用、拿到凭据并写入配置。全程无需去开放平台手动操作。
-
-### 方式 B：手动创建应用
-
-1. 前往 [飞书开放平台](https://open.feishu.cn/app) → 创建企业自建应用
-2. 开通**机器人**能力
-3. 添加权限：
-   - `im:message`（接收消息）
-   - `im:message:send_as_bot`（发送消息）
-   - `im:chat.member:readonly`（群成员真名解析，可选）
-4. 发布版本后，拿到 `App ID`（`cli_` 开头）和 `App Secret`
-5. 在 pi 里执行 `/feishubot-add`，按提示输入凭据
-
-### 配置存储
-
-凭据保存在 `~/.pi/agent/feishu-bot/config.json`，自动 `chmod 600`。**不要提交该文件到任何仓库**（本仓库 `.gitignore` 已排除）。
-
-## 🚀 使用
-
-```bash
-pi        # 启动 pi，飞书机器人自动上线
-```
-
-看到 `✅ 飞书机器人已连接: Pi` 即成功。
-
-- **单聊**：直接发消息
-- **群聊**：需要 @机器人
-
-### 快捷指令表
-
-| 指令 | 说明 |
-|------|------|
-| `帮助` / `help` | 查看全部指令 |
-| `状态` / `status` | 运行状态、模型、上下文占用、正在执行的工具、实例角色 |
-| `停止` / `stop` | 中断当前任务 |
-| `当前模型` / `模型` | 查看当前模型 |
-| `列出模型` / `models` | 可用模型列表 |
-| `切换模型到 <名称>` | 即时切换并保存默认 |
-| `会话` / `sessions` | 最近会话列表（中文名 + 会话ID + 时间 + 标记） |
-| `切会话 <序号/ID/名称>` | 切换到指定会话 |
-| `绑定会话 <序号/ID/名称>` | 本聊天固定路由到该会话（多实例并行） |
-| `解绑会话` | 解除路由绑定 |
-| `实例` / `instances` | 查看运行中的 pi 实例与路由角色 |
-| `新会话` / `/new` | 开启全新会话 |
-
-其余任意自然语言直接发，Pi 执行完毕自动回传结果。
-
-## 📖 使用教程
-
-### 1. 基础玩法：单实例遥控
-
-最简单的用法 —— 开一个 pi 终端，手机上用飞书随时给它派活：
-
-```bash
-pi   # 在任意目录启动
-```
-
-飞书单聊里直接发：
-
-> 帮我看看当前目录下有哪些 TS 文件，统计总行数
-
-机器人立刻弹一张流式卡片，实时滚动执行过程（跑命令、读文件……），结束后卡片定格完整结果。中途想反悔？发 `停止`。
-
-### 2. 会话管理：列表 / 切换 / 绑定
-
-发 `会话` 查看最近 10 个会话：
-
-```markdown
-### 📋 最近会话 (共 10 个)
-
-1. **综合** *(当前会话)*  📍已绑定  🟢运行中
-   • 会话ID: `01a07c38-df37-7081-a238-bcc81abd5395`
-   • 最近操作: 2026-09-08 19:29
-
-2. **faunet**
-   • 会话ID: `01a07c3a-c41a-77ca-95b3-0bc7cc5111ca`
-   • 最近操作: 2026-09-08 19:14
-```
-
-- **标记说明**：`*(当前会话)*` = 机器人所在会话；`📍已绑定` = 本聊天绑定的路由目标；`🟢运行中` = 该会话有 pi 实例在跑（本机或其它终端）
-- **三种切法**（口语化输入都支持）：
-  - 按序号：`切会话 2`
-  - 按会话ID：`切会话 01a07c3a`（完整 ID 或 ≥6 位前缀均可，从列表里直接复制）
-  - 按名称：`切会话 faunet`
-
-### 3. 多实例并行：每个聊天绑一个会话 ⭐
-
-这是本扩展最有价值的玩法 —— **同时开多个项目会话，飞书里分头遥控，互不干扰**。
-
-**场景**：终端 A 跑着「综合」会话，终端 B 跑着「faunet 项目」会话。让飞书两个窗口分别对应它们：
-
-```
-（终端 B）cd ~/faunet && pi -r    # 恢复 faunet 会话，实例自动加入路由
-（飞书单聊）发：绑定会话 faunet
-  → 📍 已绑定路由：本聊天 → 会话 faunet
-```
-
-之后：
-
-- 在**这个聊天**发的任何需求，自动路由到终端 B 的 faunet 实例执行，**结果回传到这个聊天**
-- 其它未绑定的聊天照常进默认实例
-- 发 `实例` 随时查看谁在运行：
-
-```markdown
-### 🖥 运行中的 Pi 实例 (共 2)
-
-1. **综合** *(本实例)*
-   • PID: 34893 · 运行 4h51m · 🌐网关
-   • 目录: /Users/todaviata
-2. **faunet**
-   • PID: 24040 · 运行 0h52m
-   • 目录: /Users/todaviata
-```
-
-**工作模式说明**：
-
-- 多实例间通过**确定性选举**产生唯一「🌐网关」持有飞书连接，其余实例为工作节点 —— 杜绝双连接消息随机分发导致的串会话
-- 消息按 `聊天ID → 绑定会话 → 承载实例` 精确投递（本地直注入 / 跨实例信箱投递），**任何实例都不会因路由而切换会话**
-- 新启动的 pi 实例 15 秒内自动加入路由；实例退出 45 秒后自动剔除
-- 网关挂了？下一个实例自动接管，无需人工干预
-- 跨实例任务的回复为纯文本直发（本实例任务仍享流式卡片）
-
-### 4. 模型切换
-
-```
-当前模型        → 🤖 当前模型: glm-5.3-flash (bai)
-列出模型        → 可用模型列表
-切换模型到 gemini-3.8-flash → ✅ 已切换并保存默认
-```
-
-### 5. 任务控制
-
-- `状态` — 空闲/执行中、模型、上下文占用 %、正在执行的工具及耗时、实例角色
-- `停止` — 中断当前任务（跨实例绑定时会路由到对应实例中止）
-- `新会话` — 开启全新会话
-
-## 🏗 工作原理
-
-```
-飞书 WS 长连接（仅网关实例持有，多实例确定性选举）
-   │ message 事件（信封：ou_发送者 / oc_聊天 / om_消息）
-   ▼
-快捷指令拦截（零 token，扩展层直接回）
-   │ 普通消息
-   ▼
-路由层：oc_ 查绑定表 → 目标会话 → 定位承载实例
-   │ 目标=自己            目标=其它实例
-   ▼                        ▼
-本地 steer 注入        inbox/{pid}/ 信箱投递
-   │                        │
-   └────────┬───────────────┘
-            ▼
-   pi 执行（工具调用 / 多轮）
-            ▼
-text_delta → 单张流式卡片 append（节流 700ms，跨实例为纯文本直发）
-            ▼
-agent_end 按信封 messageId 配对 → setContent 全文定格
-```
-
-关键设计：
-
-- **producer 挂起**：SDK 的 `stream()` 在 producer resolve 时即完结卡片，因此 producer 返回手动 Promise 保持 pending，直到任务结束才 resolve —— 这是从"多条卡片刷屏"到"单卡片"的关键
-- **请求状态机**：每条飞书消息一个 `FeishuRequest`（thinking → streaming → done），进度/缓冲全部挂在请求上，无全局可变状态污染
-- **消息信封**：注入文本携带 `[ou_发送者] [oc_聊天] [om_消息]` 三 ID，`oc_` 即路由键、`om_` 用于回复配对，多通道/多实例不串线
-- **实例注册表**：每实例心跳注册（pid/会话/目录），网关确定性选举（最早启动者），死实例自动清理
-- **跨实例信箱**：`inbox/{pid}/` 文件投递 + fs.watch 监听，目标实例原地注入自己正跑的会话 —— 零切换、零干扰
-
-## ❓ 常见问题
-
-**机器人一直不在线？**
-机器人在线状态 = pi 会话生命周期。pi 没跑，机器人就不在线。
-
-**开了多个 pi，行为不一致 / 消息乱窜（旧版本）？**
-升级到 v1.1.0+。新版通过网关选举保证只有一个实例接消息，其余实例按绑定路由精准投递。
-
-**提示"该会话当前没有运行中的 Pi 实例"？**
-绑定会话对应的实例没在跑。到对应目录 `pi -r` 恢复它，15 秒内自动重新加入路由。
-
-**连接报 `Invalid URL`？**
-SDK 的 `domain` 参数只接受完整 URL 或不传。本扩展已处理 —— 如果你二次开发时传了裸字符串 `"feishu"` 就会触发。
-
-**卡片变成多条消息？**
-producer 提前 resolve 会导致 SDK rollover 新卡片。本扩展已通过挂起 producer 解决。
-
-**群里机器人不回消息？**
-群聊必须 @机器人（`requireMention: true`）。单聊全放行。
-
-**想 7×24 在线？**
-用 launchd / systemd 跑一个常驻 pi 会话即可（tmux / `pi --mode headless`）。
-
-## 📄 License
+## License
 
 MIT
