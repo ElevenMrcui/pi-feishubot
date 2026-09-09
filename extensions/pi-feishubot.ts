@@ -124,6 +124,16 @@ const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
 const SESSION_BIND_RE = /^(?:绑定会话|会话绑定|bind)\s+(.+)$/i;
 /** 解除绑定：`解绑会话` —— 恢复默认（消息进当前会话，不再自动路由） */
 const SESSION_UNBIND_RE = /^(?:解绑会话|unbind)$/i;
+/** 启动实例：`启动实例 <目录> [恢复]` —— Ghostty 新窗口开 pi（可选恢复该目录最近会话） */
+const SPAWN_INSTANCE_RE = /^(?:启动实例|new\s+inst?)\s+(\S+)(?:\s+(恢复))?$/i;
+/** 恢复会话：`恢复会话 <会话ID/关键词>` —— Ghostty 新窗口 pi -r 恢复指定会话 */
+const RESUME_CMD_RE = /^(?:恢复会话|resume)\s+(.+)$/i;
+/** 关闭实例：`关闭实例 <pid>` */
+const KILL_INSTANCE_RE = /^(?:关闭实例|kill\s+inst?)\s+(\d+)$/i;
+/** @标签 临时路由：`@faunet 消息` —— 单条消息路由到标签对应实例（不改变绑定） */
+const TAG_ROUTE_RE = /^@([\w\u4e00-\u9fa5-]+)\s+([\s\S]+)$/;
+/** 实例数量上限（防失控） */
+const MAX_INSTANCES = 5;
 
 function isFastCommandText(content: string): boolean {
   const s = content.trim();
@@ -135,7 +145,11 @@ function isFastCommandText(content: string): boolean {
     MODEL_SWITCH_RE.test(s) ||
     SESSION_SWITCH_RE.test(s) ||
     SESSION_BIND_RE.test(s) ||
-    SESSION_UNBIND_RE.test(s)
+    SESSION_UNBIND_RE.test(s) ||
+    SPAWN_INSTANCE_RE.test(s) ||
+    RESUME_CMD_RE.test(s) ||
+    KILL_INSTANCE_RE.test(s) ||
+    TAG_ROUTE_RE.test(s)
   );
 }
 
@@ -756,6 +770,52 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ---------------- 远程实例生命周期（Ghostty 启动/关闭） ----------------
+
+  /** 在 Ghostty 新窗口启动 pi（目录 + 可选恢复模式） */
+  async function spawnGhosttyPi(dir: string, resume: boolean): Promise<void> {
+    const inner = resume ? "pi -r" : "pi";
+    const cmd = `cd "${dir}" && ${inner}`;
+    const { execFile } = await import("node:child_process");
+    await new Promise<void>((resolve, reject) => {
+      execFile("open", ["-na", "Ghostty.app", "--args", "-e", cmd], (err) => {
+        if (err) reject(new Error("Ghostty 启动失败: " + err.message));
+        else resolve();
+      });
+    });
+  }
+
+  /** 按 @标签 找实例：目录名 / 会话名 / 注册表关键词，取最近活跃 */
+  async function findInstanceByTag(tag: string): Promise<InstanceInfo | null> {
+    const live = await listLiveInstances();
+    if (!live.length) return null;
+    const q = tag.toLowerCase();
+    return (
+      live.find((x) => (x.cwd || "").toLowerCase().endsWith("/" + q)) ||
+      live.find(
+        (x) => (x.cwd || "").toLowerCase().split("/").pop() === q,
+      ) ||
+      live.find((x) => (x.sessionName || "").toLowerCase().includes(q)) ||
+      live.find((x) => x.sessionFile.toLowerCase().includes(q)) ||
+      null
+    );
+  }
+
+  /** 轮询等待新实例上线（注册表出现新 pid） */
+  async function waitNewInstance(
+    knownPids: Set<number>,
+    timeoutMs = 20_000,
+  ): Promise<InstanceInfo | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(2000);
+      const live = await listLiveInstances();
+      const fresh = live.find((x) => !knownPids.has(x.pid));
+      if (fresh) return fresh;
+    }
+    return null;
+  }
+
   // ========================================================================
   // 连接
   // ========================================================================
@@ -1176,6 +1236,10 @@ export default function (pi: ExtensionAPI) {
           "- `绑定会话 <关键词>` — 本聊天固定路由到该会话",
           "- `解绑会话` — 解除路由绑定",
           "- `实例` — 查看运行中的 Pi 实例与路由角色",
+          "- `启动实例 <目录>` — Ghostty 新窗口启动 pi（加 `恢复` 恢复会话）",
+          "- `恢复会话 <关键词>` — 新窗口恢复指定会话",
+          "- `关闭实例 <PID>` — 结束指定实例",
+          "- `@标签 <消息>` — 单条消息路由到对应实例",
           "- `reload` — 重载当前 pi 实例的扩展与配置",
           "- `新会话` / `/new` — 重置会话上下文",
           "",
@@ -1334,6 +1398,125 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         await reply(`❌ 开启新会话失败: ${e?.message || e}`);
       }
+      return true;
+    }
+
+    // 【启动实例】`启动实例 <目录> [恢复]`
+    const spawnMatch = text.trim().match(SPAWN_INSTANCE_RE);
+    if (spawnMatch) {
+      const rawDir = spawnMatch[1].replace(/^~/, homedir());
+      const resume = Boolean(spawnMatch[2]);
+      const dir = resolve(rawDir);
+      if (!existsSync(dir)) {
+        await reply(`❌ 目录不存在: ${dir}`);
+        return true;
+      }
+      const live = await listLiveInstances();
+      if (live.length >= MAX_INSTANCES) {
+        await reply(
+          `❌ 实例数已达上限（${MAX_INSTANCES}）。先发 \`实例\` 查看，用 \`关闭实例 <PID>\` 释放。`,
+        );
+        return true;
+      }
+      const dirTag = dir.split("/").filter(Boolean).pop() || dir;
+      // 若该目录已有存活实例 → 提示直接用 @标签 对话
+      const existing = await findInstanceByTag(dirTag);
+      if (existing) {
+        await reply(
+          `○ 该目录已有运行中的实例（PID ${existing.pid}），直接发 \`@${dirTag} <消息>\` 即可对话。`,
+        );
+        return true;
+      }
+      await reply(
+        `🚀 正在 Ghostty 新窗口启动 pi…\n- 目录: \`${dir}\`\n- 模式: ${resume ? "恢复最近会话" : "全新会话"}`,
+      );
+      try {
+        await spawnGhosttyPi(dir, resume);
+        const known = new Set(live.map((x) => x.pid));
+        const fresh = await waitNewInstance(known);
+        if (fresh) {
+          await reply(
+            [
+              `✅ **实例已上线**`,
+              `- **PID**: ${fresh.pid}`,
+              `- **对话**: 发 \`@${dirTag} <消息>\` 路由到它`,
+            ].join("\n"),
+          );
+        } else {
+          await reply(
+            "⚠️ Ghostty 窗口已打开，20s 内未检测到实例注册（可能在加载大会话），稍后发 `实例` 查看。",
+          );
+        }
+      } catch (e: any) {
+        await reply(`❌ 启动失败: ${e?.message || e}`);
+      }
+      return true;
+    }
+
+    // 【恢复会话】`恢复会话 <关键词>` —— Ghostty 新窗口 pi -r
+    const resumeCmd = text.trim().match(RESUME_CMD_RE);
+    if (resumeCmd) {
+      const kw = resumeCmd[1].trim();
+      const target = await resolveSessionTarget(kw);
+      if (!target) {
+        await reply(`❌ 未找到匹配的会话 "${kw}"。可先发 \`会话\` 查看列表。`);
+        return true;
+      }
+      const live = await listLiveInstances();
+      if (live.length >= MAX_INSTANCES) {
+        await reply(`❌ 实例数已达上限（${MAX_INSTANCES}）`);
+        return true;
+      }
+      // 已有实例承载该会话 → 提示直接用
+      const existing = live.find((x) => x.sessionFile === target.path);
+      if (existing) {
+        await reply(
+          `○ 该会话已在实例 PID ${existing.pid} 上运行，直接发 \`@<标签> <消息>\` 即可。`,
+        );
+        return true;
+      }
+      const sessName = target.name || target.id.slice(0, 8);
+      await reply(
+        `🚀 正在 Ghostty 新窗口恢复会话 **${sessName}**…`,
+      );
+      try {
+        await spawnGhosttyPi(target.cwd || process.cwd(), true);
+        const known = new Set(live.map((x) => x.pid));
+        const fresh = await waitNewInstance(known);
+        if (fresh) {
+          await reply(
+            `✅ **会话已在新窗口恢复**（PID ${fresh.pid}），稍后即可对话。`,
+          );
+        } else {
+          await reply("⚠️ 窗口已打开，实例注册稍后完成，可发 `实例` 查看。");
+        }
+      } catch (e: any) {
+        await reply(`❌ 恢复失败: ${e?.message || e}`);
+      }
+      return true;
+    }
+
+    // 【关闭实例】`关闭实例 <pid>`
+    const killMatch = text.trim().match(KILL_INSTANCE_RE);
+    if (killMatch) {
+      const pid = parseInt(killMatch[1], 10);
+      if (pid === SELF_PID) {
+        await reply("❌ 不能关闭自己（这是当前对话所在实例）。");
+        return true;
+      }
+      const live = await listLiveInstances();
+      const target = live.find((x) => x.pid === pid);
+      if (!target) {
+        await reply(`❌ 未找到 PID ${pid} 对应的运行中实例。发 \`实例\` 查看。`);
+        return true;
+      }
+      const { execFile } = await import("node:child_process");
+      await new Promise<void>((resolve) => {
+        execFile("kill", [String(pid)], () => resolve());
+      });
+      await reply(
+        `🛑 已发送终止信号到 PID ${pid}（${target.sessionName || target.cwd}）。`,
+      );
       return true;
     }
 
@@ -1626,6 +1809,42 @@ export default function (pi: ExtensionAPI) {
       if (handled) {
         // 顺带消费 outbox（降低工作实例委托回复的延迟）
         if (isGateway && channel) await drainOutbox();
+        return;
+      }
+    }
+
+    // 【@标签路由】`@标签 消息` —— 单条临时路由到标签对应实例执行（不改变绑定）
+    // 优先级最高：先于绑定路由处理，命中即转发
+    const tagMatch = text.match(TAG_ROUTE_RE);
+    if (tagMatch) {
+      const tag = tagMatch[1];
+      const msgText = tagMatch[2].trim();
+      if (!msgText) {
+        await channel
+          ?.reply(msg, { text: `○ @${tag} 后面要有消息内容。` })
+          .catch(() => {});
+        return;
+      }
+      const inst = await findInstanceByTag(tag);
+      if (!inst) {
+        await channel
+          ?.reply(msg, {
+            text: `❌ 未找到标签 "${tag}" 对应的运行中实例。发 \`实例\` 查看。`,
+          })
+          .catch(() => {});
+        return;
+      }
+      if (inst.pid === SELF_PID) {
+        // 就是自己：继续走本地流程（不 return，落到底部注入）
+      } else {
+        // 转发到目标实例（带完整信封，目标实例回复经 outbox 代发回本聊天）
+        await routeToInstance(inst, {
+          chatId: msg.chatId,
+          messageId: msg.messageId,
+          senderName: msg.senderName || "用户",
+          threadId: msg.threadId,
+          text: msgText,
+        });
         return;
       }
     }
