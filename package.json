@@ -30,5 +30,10 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ElevenMrcui/pi-feishubot.git"
+  },
+  "pi": {
+    "extensions": [
+      "./entry/pi-feishubot.ts"
+    ]
   }
 }
