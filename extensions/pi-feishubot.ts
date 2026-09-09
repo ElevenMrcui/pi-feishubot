@@ -81,6 +81,8 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const BINDINGS_FILE = join(CONFIG_DIR, "bindings.json");
 /** 实例注册表目录：instances/{pid}.json（心跳续约，死实例自动清理） */
 const INSTANCES_DIR = join(CONFIG_DIR, "instances");
+/** 网关锁：gateway.lock {pid, heartbeat} —— 磁盘仲裁谁持有飞书 WS 与发送队列消费权 */
+const GATEWAY_LOCK = join(CONFIG_DIR, "gateway.lock");
 /** 跨实例投递信箱：inbox/{pid}/{messageId}.json */
 const INBOX_ROOT = join(CONFIG_DIR, "inbox");
 const HEARTBEAT_MS = 15_000;
@@ -391,6 +393,47 @@ export default function (pi: ExtensionAPI) {
     return instances[0] || null;
   }
 
+  // ---------------- 磁盘仲裁网关锁（消费权/WS 持有权的唯一真相源） ----------------
+
+  async function readGatewayLock(): Promise<{ pid: number; heartbeat: number } | null> {
+    try {
+      const j = JSON.parse(await readFile(GATEWAY_LOCK, "utf8"));
+      if (Date.now() - j.heartbeat > STALE_MS) return null; // 锁已死
+      return j;
+    } catch {
+      return null;
+    }
+  }
+
+  async function claimGatewayLock(): Promise<boolean> {
+    const existing = await readGatewayLock();
+    if (existing && existing.pid !== SELF_PID) return false; // 他人持有且新鲜
+    if (!existsSync(CONFIG_DIR)) {
+      await mkdir(CONFIG_DIR, { recursive: true }).catch(() => {});
+    }
+    await writeFile(
+      GATEWAY_LOCK,
+      JSON.stringify({ pid: SELF_PID, heartbeat: Date.now() }),
+    );
+    return true;
+  }
+
+  async function renewGatewayLock() {
+    try {
+      await writeFile(
+        GATEWAY_LOCK,
+        JSON.stringify({ pid: SELF_PID, heartbeat: Date.now() }),
+      );
+    } catch {}
+  }
+
+  async function releaseGatewayLock() {
+    try {
+      const j = JSON.parse(await readFile(GATEWAY_LOCK, "utf8"));
+      if (j.pid === SELF_PID) await rm(GATEWAY_LOCK).catch(() => {});
+    } catch {}
+  }
+
   /** 按会话文件找承载它的存活实例 */
   async function findInstanceBySession(sessionFile: string): Promise<InstanceInfo | null> {
     const live = await listLiveInstances();
@@ -432,13 +475,27 @@ export default function (pi: ExtensionAPI) {
       await delegateSend(gw.pid, chatId, md);
       return;
     }
-    console.error("[feishubot] 回复无法送达：本实例无 WS 且无存活网关");
+    // 兜底：无 WS 无网关 → 落盘死信（不静默丢弃），网关上线后人工/自动可补发
+    const deadDir = join(CONFIG_DIR, "dead-letters");
+    if (!existsSync(deadDir)) {
+      await mkdir(deadDir, { recursive: true }).catch(() => {});
+    }
+    await writeFile(
+      join(deadDir, `reply-${Date.now()}.json`),
+      JSON.stringify({ chatId, md }),
+    ).catch(() => {});
+    console.error("[feishubot] 回复无法送达，已落盘 dead-letters（" + chatId + "）");
   }
 
-  /** 把飞书消息投递到目标实例的信箱（oc_ 路由键 + 完整信封） */
+  /** 把飞书消息投递到目标实例的信箱（oc_ 路由键 + 完整信封，投递前校验目标存活） */
   async function routeToInstance(target: InstanceInfo, payload: {
     chatId: string; messageId: string; senderName: string; threadId?: string; text: string;
   }) {
+    // 投递前存活校验：目标心跳必须新鲜（防写死信箱导致消息永久丢失）
+    const fresh = (await listLiveInstances()).find((x) => x.pid === target.pid);
+    if (!fresh) {
+      throw new Error(`目标实例 PID ${target.pid} 已下线`);
+    }
     const dir = inboxDir(target.pid);
     if (!existsSync(dir)) {
       await mkdir(dir, { recursive: true }).catch(() => {});
@@ -495,6 +552,36 @@ export default function (pi: ExtensionAPI) {
     if (draining) return;
     draining = true;
     try {
+      // 死信转移：其它实例的信箱若属已死进程 → 存活实例接管消化
+      // （仅网关执行，避免多实例重复转移）
+      if (isGateway && channel) {
+        try {
+          const live = await listLiveInstances();
+          const livePids = new Set(live.map((x) => x.pid));
+          if (existsSync(INBOX_ROOT)) {
+            for (const d of await readdir(INBOX_ROOT)) {
+              const pid = parseInt(d, 10);
+              if (!livePids.has(pid) && pid !== SELF_PID) {
+                const deadDir = inboxDir(pid);
+                const files = (await readdir(deadDir)).filter((f) =>
+                  f.endsWith(".json"),
+                );
+                if (files.length) {
+                  console.log(
+                    `[feishubot] 接管已死实例 PID ${pid} 的 ${files.length} 条信件`,
+                  );
+                  for (const f of files) {
+                    await rm(inboxDir(pid) + "/" + f).catch(() => {});
+                    await processInboxItem(inboxDir(pid) + "/" + f).catch(
+                      () => {},
+                    );
+                  }
+                }
+              }
+            }
+          }
+        } catch {}
+      }
       const dir = inboxDir(SELF_PID);
       if (!existsSync(dir)) return;
       for (const f of await readdir(dir)) {
@@ -568,15 +655,33 @@ export default function (pi: ExtensionAPI) {
     heartbeatTimer = setInterval(async () => {
       await writeInstanceHeartbeat();
       try {
-        const live = await listLiveInstances();
-        const gw = electGateway(live);
-        if (gw && gw.pid === SELF_PID && !isGateway) {
-          console.log("[feishubot] 原网关下线，本实例接管 WS…");
-          await connect(ctx, { force: true });
+        const lock = await readGatewayLock();
+        if (lock && lock.pid === SELF_PID) {
+          // 本实例持锁：续约 + 确保 WS 在线 + 消费发送队列
+          await renewGatewayLock();
+          if (!isGateway) isGateway = true;
+          if (!channel) {
+            console.log("[feishubot] 持锁实例恢复 WS 连接…");
+            await connect(ctx, { force: true });
+          }
+        } else if (isGateway) {
+          // 曾持锁但已失去（异常场景）：降级为工作模式（WS 由 SDK 保活，暂不断开避免闪断）
+          isGateway = false;
+        } else if (!lock || Date.now() - (lock?.heartbeat ?? 0) > STALE_MS - 1000) {
+          // 无锁或锁将死：抢占
+          if (await claimGatewayLock()) {
+            console.log("[feishubot] 抢占到网关锁，接管 WS…");
+            isGateway = true;
+            if (!channel) await connect(ctx, { force: true });
+          }
         }
-      } catch {}
-      // 网关身份则消费 outbox（工作实例委托的回复）
+      } catch (e: any) {
+        console.error("[feishubot] 心跳异常:", e?.message || e);
+      }
+      // 锁持有者消费发送队列（工作实例委托的回复）
       if (isGateway && channel) await drainOutbox();
+      // 网关顺便做死信转移
+      await drainInbox();
     }, HEARTBEAT_MS);
   }
 
@@ -682,6 +787,12 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     opts: { force?: boolean } = {},
   ): Promise<boolean> {
+    // force 模式（接管/恢复）也必须先拿到锁，杜绝双 WS
+    if (opts.force && !(await claimGatewayLock())) {
+      isGateway = false;
+      console.log("[feishubot] 接管失败：网关锁被其它实例持有");
+      return false;
+    }
     currentCtx = ctx;
     const cfg = await loadConfig();
     if (!cfg) {
@@ -689,18 +800,15 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    // 多实例单连接仲裁：只有选举出的网关实例才持有飞书 WS，
+    // 多实例单连接仲裁（磁盘锁仲裁）：抢到 gateway.lock 的实例持有飞书 WS，
     // 其余实例作为工作节点通过 inbox 接收路由消息（防止双连接消息随机分发导致串会话）
-    if (!opts.force) {
-      const live = await listLiveInstances();
-      const gw = electGateway(live);
-      if (gw && gw.pid !== SELF_PID) {
-        isGateway = false;
-        console.log(
-          `[feishubot] 检测到网关实例 PID ${gw.pid}，本实例以工作模式运行（收 inbox 路由）`,
-        );
-        return false;
-      }
+    if (!(await claimGatewayLock())) {
+      const lock = await readGatewayLock();
+      isGateway = false;
+      console.log(
+        `[feishubot] 网关锁由 PID ${lock?.pid} 持有，本实例以工作模式运行（收 inbox 路由）`,
+      );
+      return false;
     }
     isGateway = true;
 
@@ -1701,7 +1809,7 @@ export default function (pi: ExtensionAPI) {
     await drainInbox();
     const cfg = await loadConfig();
     if (cfg) {
-      await connect(ctx); // 内部有网关选举门禁：非网关实例自动转工作模式
+      await connect(ctx); // 内部有网关锁门禁：非网关实例自动转工作模式
     } else {
       console.log(
         "[feishubot] 未配置，跳过连接（/feishubot-add 或 npm 脚本注册）",
@@ -1709,7 +1817,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     for (const req of requests.values()) {
       req.finalized = true;
       if (req.streamFlushTimer) clearInterval(req.streamFlushTimer);
@@ -1726,8 +1834,9 @@ export default function (pi: ExtensionAPI) {
       outboxWatcher?.close();
     } catch {}
     outboxWatcher = null;
-    // 注销实例注册 + 清空自己的信箱
+    // 注销实例注册 + 清空自己的信箱 + 释放网关锁
     rm(join(INSTANCES_DIR, `${SELF_PID}.json`)).catch(() => {});
+    await releaseGatewayLock();
     rm(inboxDir(SELF_PID), { recursive: true, force: true }).catch(() => {});
     disconnect();
   });
