@@ -204,7 +204,7 @@ export function createBindSessionCommand(rt: BotRuntime): FastCommand {
         return true;
       }
       rt.chatBindings[req.chatId] = target.path;
-      await saveBindings(rt.chatBindings);
+      await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
       const targetName =
         target.name ||
         target._displayName ||
@@ -240,7 +240,10 @@ export function createUnbindSessionCommand(rt: BotRuntime): FastCommand {
     async execute(req) {
       if (rt.chatBindings[req.chatId]) {
         delete rt.chatBindings[req.chatId];
-        await saveBindings(rt.chatBindings);
+        await saveBindings({
+          chats: rt.chatBindings,
+          senders: rt.senderBindings,
+        });
         await replyMarkdown(
           rt,
           req,
@@ -248,6 +251,75 @@ export function createUnbindSessionCommand(rt: BotRuntime): FastCommand {
         );
       } else {
         await replyMarkdown(rt, req, "○ 本聊天没有绑定会话。");
+      }
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------- 绑定我（发送方级）
+
+/**
+ * `绑定我 <关键词>` —— 群聊里只把「我」的消息路由到指定会话。
+ * 同一群不同成员可各绑各的会话（发送方级三元绑定），互不影响聊天级绑定。
+ */
+export function createBindMeCommand(rt: BotRuntime): FastCommand {
+  return {
+    name: "bind-me",
+    localOnly: true,
+    match: (text) => SESSION_BIND_ME_RE.test(text.trim()),
+    async execute(req, text) {
+      const bindMe = text.trim().match(SESSION_BIND_ME_RE)!;
+      const arg = bindMe[1].trim();
+      const target = await resolveSessionTarget(rt, arg);
+      if (!target) {
+        await replyMarkdown(rt, req, `❌ 未找到匹配的会话 "${arg}"。可先发 \`会话\` 查看列表。`);
+        return true;
+      }
+      const senderKey = `${req.chatId}|${req.senderId || ""}`;
+      rt.senderBindings[senderKey] = target.path;
+      await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
+      const targetName =
+        target.name ||
+        target._displayName ||
+        target.firstMessage?.slice(0, 20) ||
+        target.id.slice(0, 8);
+      const inst = await findInstanceBySession(rt, target.path);
+      const instLine = inst
+        ? `- 承载实例: PID ${inst.pid}${inst.pid === rt.SELF_PID ? "（本实例）" : ""}`
+        : `- ⚠️ 该会话当前没有运行中的 Pi（启动后自动加入路由）`;
+      await replyMarkdown(
+        rt,
+        req,
+        [
+          `📍 **已绑定（发送方级）**：${req.senderName} 在本聊天 → 会话 **${targetName}**`,
+          `- **会话ID**: \`${target.id}\``,
+          instLine,
+          `- 之后仅「你」在本聊天的消息路由到该会话，其他人不受影响`,
+          `- 实例重启恢复同一会话后自动重新接上`,
+          `- 解除：发 \`解绑我\``,
+        ].join("\n"),
+      );
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------- 解绑我
+
+export function createUnbindMeCommand(rt: BotRuntime): FastCommand {
+  return {
+    name: "unbind-me",
+    localOnly: true,
+    match: (text) => SESSION_UNBIND_ME_RE.test(text.trim()),
+    async execute(req) {
+      const senderKey = `${req.chatId}|${req.senderId || ""}`;
+      if (rt.senderBindings[senderKey]) {
+        delete rt.senderBindings[senderKey];
+        await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
+        await replyMarkdown(rt, req, "🔓 已解除你的发送方级绑定，恢复聊天级/默认路由。");
+      } else {
+        await replyMarkdown(rt, req, "○ 你在本聊天没有发送方级绑定。");
       }
       return true;
     },

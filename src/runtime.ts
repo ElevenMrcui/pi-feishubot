@@ -34,6 +34,7 @@ export function createRuntime(): BotRuntime {
 
     // 绑定表缓存
     chatBindings: {},
+    senderBindings: {},
 
     // 实例角色
     SELF_PID: process.pid,

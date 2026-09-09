@@ -57,25 +57,37 @@ export async function deleteConfig() {
   }
 }
 
-// ---- 会话路由绑定表 ----
+// ---- 会话路由绑定表（v2：聊天级 + 发送方级三元绑定） ----
 
-export async function readBindings(): Promise<Record<string, string>> {
+export interface BindingTable {
+  /** 聊天级：chatId → 会话文件（整个聊天的消息都路由到该会话） */
+  chats: Record<string, string>;
+  /** 发送方级："chatId|senderId" → 会话文件（同群不同人各自绑不同会话） */
+  senders: Record<string, string>;
+}
+
+/** 读绑定表；v1 平面格式（chatId → path）自动迁移为 v2 chats 层 */
+export async function readBindings(): Promise<BindingTable> {
   try {
-    return JSON.parse(await readFile(BINDINGS_FILE, "utf8"));
+    const raw = JSON.parse(await readFile(BINDINGS_FILE, "utf8"));
+    if (raw && (raw.chats || raw.senders)) {
+      return { chats: raw.chats || {}, senders: raw.senders || {} };
+    }
+    if (raw && typeof raw === "object") return { chats: raw, senders: {} };
   } catch (e) {
-    void e; // 无绑定表 → 空表
-    return {};
+    void e; // 无绑定表/损坏 → 空表
   }
+  return { chats: {}, senders: {} };
 }
 
 /** 绑定表实时读盘（多实例下另一实例写入立即生效） */
-export async function freshBindings(): Promise<Record<string, string>> {
+export async function freshBindings(): Promise<BindingTable> {
   return readBindings();
 }
 
-export async function saveBindings(bindings: Record<string, string>) {
+export async function saveBindings(table: BindingTable) {
   await ensureConfigDir();
-  await writeFile(BINDINGS_FILE, JSON.stringify(bindings, null, 2));
+  await writeFile(BINDINGS_FILE, JSON.stringify(table, null, 2));
 }
 
 // ---- 已登录 providers（auth.json 的 key 集，不含密钥） ----

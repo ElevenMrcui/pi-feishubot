@@ -15,10 +15,14 @@ export const RELOAD_RE =
   /^\/?(reload(es|ed|s?)|rwload|relaod|rewload|relode)$/i;
 /** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
 export const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
-/** 会话路由绑定：`绑定会话 <序号/ID/关键词>` */
+/** 会话路由绑定：`绑定会话 <序号/ID/关键词>`（聊天级：整个聊天的消息都路由） */
 export const SESSION_BIND_RE = /^(?:绑定会话|会话绑定|bind)\s+(.+)$/i;
 /** 解除绑定：`解绑会话` */
 export const SESSION_UNBIND_RE = /^(?:解绑会话|unbind)$/i;
+/** 发送方级绑定：`绑定我 <关键词>` —— 群里只把「我」的消息路由到指定会话 */
+export const SESSION_BIND_ME_RE = /^(?:绑定我|bind\s*me)\s+(.+)$/i;
+/** 解除发送方级绑定：`解绑我` */
+export const SESSION_UNBIND_ME_RE = /^(?:解绑我|unbind\s*me)$/i;
 /** 启动实例：`启动实例 <目录> [恢复]` */
 export const SPAWN_INSTANCE_RE =
   /^(?:启动实例|new\s+inst?)\s+(\S+)(?:\s+(恢复))?$/i;

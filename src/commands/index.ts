@@ -17,9 +17,11 @@ import {
   createSwitchModelCommand,
 } from "./model.ts";
 import {
+  createBindMeCommand,
   createBindSessionCommand,
   createSessionsCommand,
   createSwitchSessionCommand,
+  createUnbindMeCommand,
   createUnbindSessionCommand,
 } from "./session.ts";
 import {
@@ -67,6 +69,8 @@ export function createCommandRegistry(
     createSwitchSessionCommand(rt, pi),
     createBindSessionCommand(rt),
     createUnbindSessionCommand(rt),
+    createBindMeCommand(rt),
+    createUnbindMeCommand(rt),
   ];
 
   function find(text: string): FastCommand | null {

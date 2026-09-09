@@ -48,11 +48,12 @@ function tagRouteHandler(rt: BotRuntime): RouteHandler {
       rc.routeToLocal = true;
       return false;
     }
-    // 转发到目标实例（带完整信封，目标实例回复经 outbox 代发回本聊天）
+    // 转发到目标实例（带完整信封，目标实例回复经直发/委托通路回本聊天）
     await routeToInstance(inst, rt, {
       chatId: req.chatId,
       messageId: req.messageId,
       senderName: req.senderName || "用户",
+      senderId: msg.senderId || req.senderId,
       threadId: req.threadId,
       text: msgText,
     });
@@ -60,14 +61,17 @@ function tagRouteHandler(rt: BotRuntime): RouteHandler {
   };
 }
 
-/** 绑定表路由：绑定到其它实例的消息一律投递（除网关级 LOCAL_ONLY 指令） */
+/** 绑定表路由：发送方级 → 聊天级 → 默认（绑定到其它实例的消息一律投递，除网关级 LOCAL_ONLY 指令） */
 function bindingRouteHandler(rt: BotRuntime): RouteHandler {
   return async (rc) => {
-    const { req, text } = rc;
+    const { msg, req, text } = rc;
     if (rc.routeToLocal) return false; // @标签已指定本实例落地，跳过绑定路由
-    const bindings = await freshBindings();
-    const boundPath = bindings[req.chatId];
-    rt.chatBindings = bindings;
+    const table = await freshBindings();
+    rt.chatBindings = table.chats;
+    rt.senderBindings = table.senders;
+    // 三元绑定查找：发送方级（同群不同人各绑各的）优先于聊天级
+    const senderKey = `${req.chatId}|${msg.senderId || req.senderId || ""}`;
+    const boundPath = rt.senderBindings[senderKey] || table.chats[req.chatId];
     if (!boundPath || boundPath === currentSessionFile(rt)) return false;
 
     const target = await findInstanceBySession(rt, boundPath);
@@ -94,10 +98,11 @@ function bindingRouteHandler(rt: BotRuntime): RouteHandler {
       chatId: req.chatId,
       messageId: req.messageId,
       senderName: req.senderName,
+      senderId: msg.senderId || req.senderId,
       threadId: req.threadId,
       text,
     });
-    return true; // 投递完成，回复由目标实例经 agent_end/委托通路送达
+    return true; // 投递完成，回复由目标实例经直发/委托通路送达
   };
 }
 

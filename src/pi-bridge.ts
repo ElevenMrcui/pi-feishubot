@@ -77,7 +77,9 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
   pi.on("session_start", async (_e: any, ctx: any) => {
     rt.currentCtx = ctx;
     if (!isSDKAvailable()) return;
-    rt.chatBindings = await readBindings();
+    const table = await readBindings();
+    rt.chatBindings = table.chats;
+    rt.senderBindings = table.senders;
     // 实例注册 + 心跳（多实例自动入网；新实例启动即出现在 实例 列表）
     await writeInstanceHeartbeat(rt);
     startHeartbeat(rt, ctx, pi);

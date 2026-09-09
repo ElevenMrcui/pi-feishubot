@@ -44,6 +44,8 @@ export interface FeishuRequest {
  chatId: string;
  messageId: string;
  senderName: string;
+ /** 发送方 open_id（发送方级路由绑定键的一半） */
+ senderId?: string;
  threadId?: string;
  phase: RequestPhase;
  streamCtrl: any | null; // MarkdownStreamController
@@ -142,6 +144,8 @@ export interface BotRuntime {
 
  // ---- 会话路由绑定表缓存 ----
  chatBindings: Record<string, string>;
+ /** 发送方级绑定："chatId|senderId" → 会话文件（同群不同人各绑各的） */
+ senderBindings: Record<string, string>;
 
  // ---- 实例角色 ----
  readonly SELF_PID: number;

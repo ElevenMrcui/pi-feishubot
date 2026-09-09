@@ -39,6 +39,7 @@ export function createMessageHandler(rt: BotRuntime, pi: any) {
       chatId: msg.chatId,
       messageId: msg.messageId,
       senderName: msg.senderName || msg.senderId || "用户",
+      senderId: msg.senderId,
       threadId: msg.threadId,
       phase: "thinking",
       streamCtrl: null,

@@ -42,6 +42,7 @@ export async function routeToInstance(
     chatId: string;
     messageId: string;
     senderName: string;
+    senderId?: string;
     threadId?: string;
     text: string;
   },
@@ -76,6 +77,7 @@ export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
       chatId: payload.chatId,
       messageId: payload.messageId,
       senderName: payload.senderName || "用户",
+      senderId: payload.senderId,
       threadId: payload.threadId,
       phase: "thinking",
       streamCtrl: null,
