@@ -1,11 +1,4 @@
 node_modules/
+*.tgz
+legacy-v2-monolith.ts.bak
 package-lock.json
-
-# 飞书凭据 — 严禁提交
-.pi/agent/feishu-bot/
-feishu-bot/
-config.json
-*.secret.*
-
-.DS_Store
-*.log
