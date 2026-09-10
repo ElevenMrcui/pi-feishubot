@@ -89,7 +89,9 @@ export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
       lastActivityAt: 0,
       startedAtMs: Date.now(),
       finalized: false,
-      viaInbox: true,
+      progressTimer: null,
+        progressSent: 0,
+        viaInbox: true,
     };
     // 快捷指令在目标会话的实例上执行（会话级指令语义正确性的关键）
     if (rt.svc.matchesFastCommand(payload.text)) {
@@ -98,11 +100,24 @@ export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
     }
     rt.requests.set(req.messageId, req);
     rt.activeRequest = req;
+    rt.stats.received++;
+    // worker 即时 ack：注入成功即回执（网关实例走占位卡，worker 无流式 → 文本回执）
+    const busy = rt.currentCtx && !rt.currentCtx.isIdle();
+    void rt.svc
+      .sendToChat(
+        req.chatId,
+        busy ? "🫥 收到，已排队（当前有任务执行中，完成后处理）…"
+             : "🫥 收到，开始处理…",
+      )
+      .catch(() => {});
     const injectText = `[feishubot] [${req.senderName}] [${req.chatId}] [${req.messageId}]\n${payload.text}`;
     await pi.sendUserMessage([{ type: "text", text: injectText }], {
       deliverAs: "steer",
     });
     rt.svc.scheduleAck(req);
+    // 无流式卡片的实例：启动文本进度播报（30s 节流，工具级状态可见）
+    const { startProgressNotifier } = await import("./streaming.ts");
+    startProgressNotifier(rt, req);
   } catch (e: any) {
     console.error("[feishubot] inbox 处理失败:", e?.message || e);
   }

@@ -31,6 +31,12 @@ import {
   createSpawnInstanceCommand,
 } from "./instances.ts";
 import { createReloadCommand } from "./reload.ts";
+import {
+  createMuteCommand,
+  createSayCommand,
+  createStopSayCommand,
+  createVolumeCommand,
+} from "./machine.ts";
 
 export interface CommandRegistry {
   /** 全部指令（按优先级排列） */
@@ -71,6 +77,10 @@ export function createCommandRegistry(
     createUnbindSessionCommand(rt),
     createBindMeCommand(rt),
     createUnbindMeCommand(rt),
+    createSayCommand(rt),
+    createStopSayCommand(rt),
+    createVolumeCommand(rt),
+    createMuteCommand(rt),
   ];
 
   function find(text: string): FastCommand | null {

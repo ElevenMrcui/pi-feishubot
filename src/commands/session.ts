@@ -10,8 +10,10 @@ import type { BotRuntime, FastCommand } from "../types.ts";
 import { replyMarkdown } from "../sender.ts";
 import { readBindings, saveBindings } from "../storage.ts";
 import {
+  SESSION_BIND_ME_RE,
   SESSION_BIND_RE,
   SESSION_SWITCH_RE,
+  SESSION_UNBIND_ME_RE,
   SESSION_UNBIND_RE,
   sessionDisplayName,
 } from "../utils.ts";

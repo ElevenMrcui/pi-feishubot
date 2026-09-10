@@ -43,6 +43,7 @@ export function createRuntime(): BotRuntime {
     inboxWatcher: null,
     outboxWatcher: null,
     startedAt: Date.now(),
+    stats: { received: 0, replied: 0 },
 
     // 互斥标志
     draining: false,

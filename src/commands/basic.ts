@@ -39,6 +39,10 @@ export function createHelpCommand(rt: BotRuntime): FastCommand {
           "- `@<标签> <消息>` — 单条消息路由到指定实例",
           "- `启动实例 <目录> [恢复]` / `恢复会话 <关键词>` / `关闭实例 <pid>`",
           "- `重载` — 重载当前实例扩展",
+          "",
+          "**本机遥控**",
+          "- `喊话 <文本>` — TTS 外放（婷婷女声）",
+          "- `停止喊话` · `音量 <0-100>` · `静音`",
         ].join("\n"),
       );
       return true;
@@ -102,6 +106,7 @@ export function createStatusCommand(rt: BotRuntime): FastCommand {
         `- **上下文**: ${usage}`,
         `- **工作目录**: \`${rt.currentCtx?.cwd || process.cwd()}\``,
         `- **实例角色**: PID ${rt.SELF_PID} ${rt.isGateway ? "· 🌐网关(接飞书)" : "· 工作节点(收路由)"}`,
+        `- **处理统计**: 收 ${rt.stats.received} / 回 ${rt.stats.replied} · 运行 ${Math.round((Date.now() - rt.startedAt) / 60000)} 分钟`,
       ];
       if (busy && rt.activeToolInfo) {
         const toolSec = Math.round(

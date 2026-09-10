@@ -11,7 +11,7 @@
  * （switch-session/new-session/reload 由命令通道以 ExtensionCommandContext 执行）
  */
 import type { BotRuntime } from "./types.ts";
-import { finalizeRequest, ensureStream } from "./streaming.ts";
+import { finalizeRequest, ensureStream, stopProgressNotifier } from "./streaming.ts";
 import { sendReplyOut } from "./sender.ts";
 import { summarizeArgs } from "./utils.ts";
 import { readBindings } from "./storage.ts";
@@ -29,6 +29,12 @@ import { loadConfig, saveConfig, deleteConfig } from "./storage.ts";
 // ========================================================================
 // 事件订阅
 // ========================================================================
+
+/** finalizedMessageIds 带 30min TTL（防长期运行内存泄漏） */
+function markFinalized(rt: BotRuntime, id: string) {
+  rt.finalizedMessageIds.add(id);
+  setTimeout(() => rt.finalizedMessageIds.delete(id), 30 * 60 * 1000);
+}
 
 export function registerPiObservers(rt: BotRuntime, pi: any) {
   // token 级流式 → 打字机卡片
@@ -144,7 +150,7 @@ async function pairAndDeliverReplies(rt: BotRuntime, messages: any[]) {
 
     const req = rt.requests.get(messageId);
     if (req && req.finalized) {
-      rt.finalizedMessageIds.add(messageId);
+      markFinalized(rt, messageId);
       continue;
     }
 
@@ -179,18 +185,20 @@ async function pairAndDeliverReplies(rt: BotRuntime, messages: any[]) {
     if (!content) {
       if (!req) {
         // 历史孤儿消息，坚决不向飞书补发无意义的告警
-        rt.finalizedMessageIds.add(messageId);
+        markFinalized(rt, messageId);
         continue;
       }
       content = "⚠️ 任务已结束，但未产生回复文本。";
     }
 
     // 5. 正式定格或发送
-    rt.finalizedMessageIds.add(messageId);
+    markFinalized(rt, messageId);
+    rt.stats.replied++;
     if (req && !req.viaInbox) {
       await finalizeRequest(rt, req, content);
     } else {
-      // 跨实例投递的消息（或无上下文）：走回复出口（有 WS 自己发，否则委托网关）
+      // 跨实例投递的消息（或无上下文）：先停进度播报，再走回复出口（直发/委托网关）
+      if (req) stopProgressNotifier(req);
       await sendReplyOut(rt, chatId, content);
     }
   }

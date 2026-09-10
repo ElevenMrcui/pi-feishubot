@@ -158,6 +158,7 @@ export async function finalizeRequest(
   req.finalized = true;
   req.phase = "done";
   clearAckTimer(req);
+  stopProgressNotifier(req);
   if (req.aliveTimer) {
     clearInterval(req.aliveTimer);
     req.aliveTimer = null;
@@ -206,4 +207,48 @@ export async function finalizeRequest(
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ========================================================================
+// worker 进度播报（无流式卡片实例的状态可见性）
+// ========================================================================
+
+const PROGRESS_TICK_MS = 30_000; // 30s 节流
+const PROGRESS_MAX_SENDS = 20; // 单请求上限，防刷屏
+
+/**
+ * worker 进度播报：每 30s 经 send-only 通道播报当前工具/阶段 + 累计耗时。
+ * 网关实例有流式卡片（streamCtrl），自动跳过避免双重噪音。
+ */
+export function startProgressNotifier(rt: BotRuntime, req: FeishuRequest) {
+  if (req.progressTimer) return;
+  if (rt.channel) return; // 网关：有打字机卡片，无需文本播报
+  req.progressSent = 0;
+  req.progressTimer = setInterval(async () => {
+    if (req.finalized) {
+      stopProgressNotifier(req);
+      return;
+    }
+    if (req.progressSent >= PROGRESS_MAX_SENDS) {
+      stopProgressNotifier(req);
+      return;
+    }
+    const sec = Math.round((Date.now() - (req.startedAtMs || Date.now())) / 1000);
+    const tool = rt.activeToolInfo
+      ? `正在执行 \`${rt.activeToolInfo.name}\`${rt.activeToolInfo.argsSummary ? ` (${rt.activeToolInfo.argsSummary})` : ""}`
+      : "思考 / 生成回答中";
+    try {
+      await sendToChat(rt, req.chatId, `⏳ [${sec}s] ${tool}`);
+      req.progressSent++;
+    } catch (e) {
+      void e; // 单次播报失败 → 下轮重试
+    }
+  }, PROGRESS_TICK_MS);
+}
+
+export function stopProgressNotifier(req: FeishuRequest) {
+  if (req.progressTimer) {
+    clearInterval(req.progressTimer);
+    req.progressTimer = null;
+  }
 }

@@ -11,5 +11,5 @@
 import main from "../src/main.ts";
 
 export default function (pi: any) {
-  return main(pi);
+ return main(pi);
 }

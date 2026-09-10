@@ -55,6 +55,8 @@ export interface FeishuRequest {
  streamPlaceholder?: string | null; // "处理中"占位文本（占位卡首刷时覆盖）
  ackTimer: NodeJS.Timeout | null; // 占位回执定时器
  aliveTimer: NodeJS.Timeout | null; // 运行心跳定时器（占位期更新"仍在运行 n s"）
+ progressTimer: NodeJS.Timeout | null; // worker 进度播报定时器（无流式卡片的实例）
+ progressSent: number; // 已发进度条数（防刷屏上限）
  lastActivityAt: number; // 最近一次内容活动（delta/append）时间
  startedAtMs?: number;
  finalized: boolean;
@@ -154,6 +156,8 @@ export interface BotRuntime {
  inboxWatcher: FSWatcher | null;
  outboxWatcher: FSWatcher | null;
  readonly startedAt: number;
+ /** 可观测性计数：已接收（注入 pi）与已回传（飞书）的消息数 */
+ stats: { received: number; replied: number };
 
  // ---- 内部互斥标志 ----
  draining: boolean;
