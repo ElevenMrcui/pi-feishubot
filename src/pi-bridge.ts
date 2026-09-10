@@ -10,6 +10,10 @@
  * 命令：/feishubot-add|remove|reconnect|status + 内部通道命令
  * （switch-session/new-session/reload 由命令通道以 ExtensionCommandContext 执行）
  */
+import { watch as _fsWatch } from "node:fs";
+import { mkdir as _mkdir } from "node:fs/promises";
+import { join as _join } from "node:path";
+import { homedir as _homedir } from "node:os";
 import type { BotRuntime } from "./types.ts";
 import { finalizeRequest, ensureStream, stopProgressNotifier } from "./streaming.ts";
 import { sendReplyOut } from "./sender.ts";
@@ -96,10 +100,61 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
       await connect(rt, ctx); // 内部有网关锁门禁：非网关实例自动转工作模式
     } else {
       console.log(
-        "[feishubot] 未配置，跳过连接（/feishubot-add 或 npm 脚本注册）",
+        "[feishubot] 未配置，进入配置监视模式（config.json 出现后自动连接）",
       );
+      startConfigAutoConnect(rt, ctx);
     }
   });
+
+  /** 未配置时的自愈：监视 config.json 出现（fs.watch + 15s 兜底轮询）→ 自动连接 */
+  function startConfigAutoConnect(rt: BotRuntime, ctx: any) {
+    const CONFIG_DIR = _join(_homedir(), ".pi", "agent", "feishu-bot");
+    if (rt.configPollTimer) return;
+    const tryConnect = async () => {
+      if (rt.connected) return stopAutoConnect(rt);
+      const cfg = await loadConfig();
+      if (!cfg) return;
+      stopAutoConnect(rt);
+      console.log("[feishubot] 检测到配置出现，自动连接…");
+      await connect(rt, ctx);
+    };
+    // fs.watch（目录先确保存在，避免 ENOENT）
+    _mkdir(CONFIG_DIR, { recursive: true })
+      .then(() => {
+        if (rt.configWatcher) return;
+        try {
+          rt.configWatcher = _fsWatch(CONFIG_DIR, (_ev, fname) => {
+            if (!fname || String(fname) === "config.json") void tryConnect();
+          });
+          rt.configWatcher.on?.("error", () => {
+            try {
+              rt.configWatcher?.close();
+            } catch (e) {
+              void e;
+            }
+            rt.configWatcher = null;
+          });
+        } catch (e: any) {
+          console.error("[feishubot] config watch 失败（15s 轮询兜底）:", e?.message);
+        }
+      })
+      .catch(() => {});
+    rt.configPollTimer = setInterval(() => void tryConnect(), 15_000);
+    void tryConnect();
+  }
+
+  function stopAutoConnect(rt: BotRuntime) {
+    if (rt.configPollTimer) {
+      clearInterval(rt.configPollTimer);
+      rt.configPollTimer = null;
+    }
+    try {
+      rt.configWatcher?.close();
+    } catch (e) {
+      void e;
+    }
+    rt.configWatcher = null;
+  }
 
   pi.on("session_shutdown", async () => {
     for (const req of rt.requests.values()) {

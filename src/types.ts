@@ -156,6 +156,8 @@ export interface BotRuntime {
  inboxWatcher: FSWatcher | null;
  outboxWatcher: FSWatcher | null;
  mailboxPollTimer: NodeJS.Timeout | null;
+ configWatcher: FSWatcher | null;
+ configPollTimer: NodeJS.Timeout | null;
  readonly startedAt: number;
  /** 可观测性计数：已接收（注入 pi）与已回传（飞书）的消息数 */
  stats: { received: number; replied: number };

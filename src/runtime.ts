@@ -43,6 +43,8 @@ export function createRuntime(): BotRuntime {
     inboxWatcher: null,
     outboxWatcher: null,
     mailboxPollTimer: null,
+    configWatcher: null,
+    configPollTimer: null,
     startedAt: Date.now(),
     stats: { received: 0, replied: 0 },
 
