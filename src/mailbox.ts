@@ -66,8 +66,10 @@ export async function routeToInstance(
 /** 处理投递进来的消息：直接注入本实例（本实例就在目标会话里，零切换） */
 export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
   try {
-    const payload = JSON.parse(await readFile(file, "utf8"));
+    const raw = await readFile(file, "utf8");
+    // 所有权前置：读到内容即删文件 —— 残缺 JSON（毒丸）解析失败也不会无限重试刷屏
     await rm(file).catch(() => {});
+    const payload = JSON.parse(raw);
     if (!payload?.messageId || !payload?.chatId || !payload?.text) return;
     if (rt.seenMessages.has(payload.messageId)) return;
     rt.seenMessages.add(payload.messageId);
