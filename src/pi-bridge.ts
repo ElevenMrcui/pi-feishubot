@@ -110,6 +110,8 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     rt.activeRequest = null;
     if (rt.heartbeatTimer) clearInterval(rt.heartbeatTimer);
     rt.heartbeatTimer = null;
+    if (rt.mailboxPollTimer) clearInterval(rt.mailboxPollTimer);
+    rt.mailboxPollTimer = null;
     try {
       rt.inboxWatcher?.close();
     } catch (e) {

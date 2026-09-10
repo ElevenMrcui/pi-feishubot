@@ -42,6 +42,7 @@ export function createRuntime(): BotRuntime {
     heartbeatTimer: null,
     inboxWatcher: null,
     outboxWatcher: null,
+    mailboxPollTimer: null,
     startedAt: Date.now(),
     stats: { received: 0, replied: 0 },
 

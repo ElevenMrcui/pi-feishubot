@@ -200,33 +200,63 @@ export async function drainOutbox(rt: BotRuntime) {
  * 挂载信箱监听（async：目录就绪后再 fsWatch，修复新实例首启的 ENOENT 竞态 ——
  * 原实现 mkdir 异步发射后不管，fsWatch 同步执行时目录尚未存在）
  */
-export async function startInboxWatcher(rt: BotRuntime) {
+export function startInboxWatcher(rt: BotRuntime) {
+  void ensureDirsAndWatch(rt);
+  // 兜底轮询：fs.watch 在 macOS 对高频目录会静默失效（探针实测）——
+  // 3s 轮询保证最坏延迟有界，watcher 正常时事件即时触发（draining 互斥去重）
+  if (!rt.mailboxPollTimer) {
+    rt.mailboxPollTimer = setInterval(() => {
+      void rt.svc.drainInbox();
+      if (rt.isGateway && rt.channel) void rt.svc.drainOutbox();
+    }, 3000);
+  }
+}
+
+async function ensureDirsAndWatch(rt: BotRuntime) {
   const dir = inboxDir(rt, rt.SELF_PID);
   await mkdir(dir, { recursive: true });
-  try {
-    rt.inboxWatcher?.close();
-  } catch (e) {
-    void e; // 旧 watcher 未初始化
-  }
-  try {
-    rt.inboxWatcher = fsWatch(dir, () => void rt.svc.drainInbox());
-  } catch (e: any) {
-    console.error("[feishubot] inbox watch 失败:", e?.message);
-  }
-  // 网关：监听自己的 outbox（工作实例委托的回复）→ 秒级代发
   const outDir = join(INBOX_ROOT, String(rt.SELF_PID), "outbox");
   await mkdir(outDir, { recursive: true });
-  try {
-    rt.outboxWatcher?.close();
-  } catch (e) {
-    void e; // 旧 watcher 未初始化
-  }
-  try {
-    rt.outboxWatcher = fsWatch(outDir, () => void rt.svc.drainOutbox());
-  } catch (e: any) {
-    console.error("[feishubot] outbox watch 失败:", e?.message);
-  }
+
+  attachWatch(rt, "inboxWatcher", dir, () => void rt.svc.drainInbox());
+  attachWatch(rt, "outboxWatcher", outDir, () => void rt.svc.drainOutbox());
+
   // 启动时处理残留（上次崩溃/退出未消费的）
   void rt.svc.drainInbox();
   if (rt.isGateway && rt.channel) void rt.svc.drainOutbox();
+}
+
+/** 挂单个 watch；error/失效时自动重建目录并重挂（自愈） */
+function attachWatch(
+  rt: BotRuntime,
+  slot: "inboxWatcher" | "outboxWatcher",
+  dir: string,
+  onChange: () => void,
+) {
+  try {
+    (rt as any)[slot]?.close();
+  } catch (e) {
+    void e; // 旧 watcher 未初始化
+  }
+  try {
+    const w = fsWatch(dir, () => onChange());
+    // fs.watch 在目录被删/失效时经 error 事件暴露 → 清目录重挂
+    (w as any).on?.("error", () => {
+      try {
+        w.close();
+      } catch (e) {
+        void e;
+      }
+      if ((rt as any)[slot] === w) {
+        (rt as any)[slot] = null;
+        mkdir(dir, { recursive: true })
+          .then(() => attachWatch(rt, slot, dir, onChange))
+          .catch(() => {});
+      }
+    });
+    (rt as any)[slot] = w;
+  } catch (e: any) {
+    console.error(`[feishubot] ${slot} watch 失败（5s 后重挂）:`, e?.message);
+    setTimeout(() => attachWatch(rt, slot, dir, onChange), 5000);
+  }
 }

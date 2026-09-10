@@ -24,7 +24,10 @@ export function createSayCommand(rt: BotRuntime): FastCommand {
     name: "say",
     match: (text) => /^(?:喊话|外放|语音)\s+[\s\S]+$/.test(text.trim()),
     async execute(req, text) {
-      const content = text.trim().replace(/^(?:喊话|外放|语音)\s+/, "").slice(0, 200);
+      const content = text
+        .trim()
+        .replace(/^(?:喊话|外放|语音)\s+/, "")
+        .slice(0, 200);
       if (!content) {
         await replyMarkdown(rt, req, "○ 喊话内容不能为空。用法：`喊话 <文本>`");
         return true;
