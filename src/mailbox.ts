@@ -124,6 +124,18 @@ export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
     console.error("[feishubot] inbox 处理失败:", e?.message || e);
   }
 }
+/** 信箱文件入口：读内容 → 删文件（拿所有权）→ 纯处理 */
+export async function processInboxItem(rt: BotRuntime, pi: any, file: string) {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (e: any) {
+    console.error("[feishubot] inbox 读取失败:", e?.message || e);
+    return;
+  }
+  await rm(file).catch(() => {});
+  await processInboxRaw(rt, pi, raw);
+}
 
 export async function drainInbox(rt: BotRuntime, pi: any) {
   if (rt.draining) return;
@@ -148,12 +160,17 @@ export async function drainInbox(rt: BotRuntime, pi: any) {
                   `[feishubot] 接管已死实例 PID ${pid} 的 ${files.length} 条信件`,
                 );
                 for (const f of files) {
-                  await rm(inboxDir(rt, pid) + "/" + f).catch(() => {});
-                  await processInboxItem(
-                    rt,
-                    pi,
-                    inboxDir(rt, pid) + "/" + f,
-                  ).catch(() => {});
+                  // 先读后删：rm 前置会让 processInboxItem 重读已删文件（ENOENT + 内容丢失）
+                  const full = inboxDir(rt, pid) + "/" + f;
+                  let raw: string | null = null;
+                  try {
+                    raw = await readFile(full, "utf8");
+                  } catch (err) {
+                    void err; // 文件已消失
+                  }
+                  await rm(full).catch(() => {});
+                  if (raw == null) continue;
+                  await processInboxRaw(rt, pi, raw).catch(() => {});
                 }
               }
             }
