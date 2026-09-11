@@ -90,11 +90,18 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     const table = await readBindings();
     rt.chatBindings = table.chats;
     rt.senderBindings = table.senders;
+    // 任务监听的通知目标：绑定到本实例（综合）会话的聊天
+    (rt as any).__boundChats = Object.entries(table.chats || {})
+      .filter(([, p]) => p === (rt.currentCtx as any)?.sessionManager?.sessionFile)
+      .map(([c]) => c);
     // 实例注册 + 心跳（多实例自动入网；新实例启动即出现在 实例 列表）
     await writeInstanceHeartbeat(rt);
     startHeartbeat(rt, ctx, pi);
     await startInboxWatcher(rt);
     await drainInbox(rt, pi);
+    // faunet 任务完成监听（网关实例专用；由 startTaskWatcher 内部判断）
+    const { startTaskWatcher } = await import("./task-watcher.ts");
+    startTaskWatcher(rt);
     const cfg = await loadConfig();
     if (cfg) {
       await connect(rt, ctx); // 内部有网关锁门禁：非网关实例自动转工作模式
@@ -167,6 +174,8 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     rt.heartbeatTimer = null;
     if (rt.mailboxPollTimer) clearInterval(rt.mailboxPollTimer);
     rt.mailboxPollTimer = null;
+    const { stopTaskWatcher } = await import("./task-watcher.ts");
+    stopTaskWatcher(rt);
     try {
       rt.inboxWatcher?.close();
     } catch (e) {

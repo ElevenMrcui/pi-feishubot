@@ -40,6 +40,7 @@ export function createRuntime(): BotRuntime {
     SELF_PID: process.pid,
     isGateway: false,
     heartbeatTimer: null,
+    taskWatcherTimer: null,
     inboxWatcher: null,
     outboxWatcher: null,
     mailboxPollTimer: null,

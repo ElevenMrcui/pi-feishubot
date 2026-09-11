@@ -153,6 +153,7 @@ export interface BotRuntime {
  readonly SELF_PID: number;
  isGateway: boolean;
  heartbeatTimer: NodeJS.Timeout | null;
+ taskWatcherTimer: NodeJS.Timeout | null;
  inboxWatcher: FSWatcher | null;
  outboxWatcher: FSWatcher | null;
  mailboxPollTimer: NodeJS.Timeout | null;
