@@ -40,6 +40,13 @@ function markFinalized(rt: BotRuntime, id: string) {
   setTimeout(() => rt.finalizedMessageIds.delete(id), 30 * 60 * 1000);
 }
 
+/** 安全投递：异步失败仅记日志，绝不冒泡（feishubot 不崩宿主） */
+function safeFire(p: Promise<unknown>, label: string) {
+  p.catch((e: any) => {
+    console.error(`[feishubot] ${label} 异步失败:`, e?.message || e);
+  });
+}
+
 export function registerPiObservers(rt: BotRuntime, pi: any) {
   // token 级流式 → 打字机卡片
   // 注意：不以 rt.connected 作门禁 —— 工作实例（无 WS）也处理：
@@ -77,7 +84,12 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     // 不以 rt.connected 作门禁：工作实例（无 WS，拿不到网关锁）也必须回传！
     // 回复投递不依赖本实例 WS —— sendReplyOut 有委托网关通路；
     // 是否本扩展的消息由 [feishubot] 注入前缀匹配过滤。
-    await pairAndDeliverReplies(rt, e.messages as any[]);
+    // 异常边界：回复配对/投递的任何失败只记日志（绝不崩 pi 宿主）。
+    try {
+      await pairAndDeliverReplies(rt, e.messages as any[]);
+    } catch (e: any) {
+      console.error("[feishubot] agent_end 回复配对异常:", e?.message || e);
+    }
   });
 
   // ======================================================================
@@ -85,6 +97,7 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
   // ======================================================================
 
   pi.on("session_start", async (_e: any, ctx: any) => {
+   try {
     rt.currentCtx = ctx;
     if (!isSDKAvailable()) return;
     const table = await readBindings();
@@ -111,6 +124,9 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
       );
       startConfigAutoConnect(rt, ctx);
     }
+   } catch (e: any) {
+    console.error("[feishubot] session_start 异常:", e?.message || e);
+   }
   });
 
   /** 未配置时的自愈：监视 config.json 出现（fs.watch + 15s 兜底轮询）→ 自动连接 */

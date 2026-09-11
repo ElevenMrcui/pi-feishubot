@@ -17,6 +17,13 @@ import { INBOX_ROOT } from "./storage.ts";
 import type { BotRuntime, FeishuRequest, InstanceInfo } from "./types.ts";
 import { listLiveInstances } from "./instances.ts";
 
+/** 安全投递：异步操作永不冒泡为 unhandledRejection（feishubot 不得崩掉 pi 宿主） */
+function safeFire(p: Promise<unknown>, label: string) {
+  p.catch((e: any) => {
+    console.error(`[feishubot] ${label} 异步失败:`, e?.message || e);
+  });
+}
+
 export function inboxDir(rt: BotRuntime, pid: number) {
   return join(INBOX_ROOT, String(pid));
 }
@@ -250,27 +257,37 @@ export async function drainOutbox(rt: BotRuntime) {
  * watcher 正常时事件即时触发（draining 标志互斥去重），失效时最坏 3s 延迟。
  */
 export function startInboxWatcher(rt: BotRuntime) {
-  void ensureDirsAndWatch(rt);
+  safeFire(ensureDirsAndWatch(rt), "ensureDirsAndWatch");
   if (!rt.mailboxPollTimer) {
     rt.mailboxPollTimer = setInterval(() => {
-      void rt.svc.drainInbox();
-      if (rt.isGateway && rt.channel) void rt.svc.drainOutbox();
+      safeFire(rt.svc.drainInbox(), "drainInbox");
+      if (rt.isGateway && rt.channel) safeFire(rt.svc.drainOutbox(), "drainOutbox");
     }, 3000);
   }
 }
 
 async function ensureDirsAndWatch(rt: BotRuntime) {
   const dir = inboxDir(rt, rt.SELF_PID);
-  await mkdir(dir, { recursive: true });
   const outDir = join(INBOX_ROOT, String(rt.SELF_PID), "outbox");
-  await mkdir(outDir, { recursive: true });
+  // mkdir 竞态防护：递归创建在并发删父目录时可能 ENOENT → 3 次退避重试
+  for (const d of [dir, outDir]) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await mkdir(d, { recursive: true });
+        break;
+      } catch (e: any) {
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+      }
+    }
+  }
 
-  attachWatch(rt, "inboxWatcher", dir, () => void rt.svc.drainInbox());
-  attachWatch(rt, "outboxWatcher", outDir, () => void rt.svc.drainOutbox());
+  attachWatch(rt, "inboxWatcher", dir, () => safeFire(rt.svc.drainInbox(), "drainInbox"));
+  attachWatch(rt, "outboxWatcher", outDir, () => safeFire(rt.svc.drainOutbox(), "drainOutbox"));
 
   // 启动时处理残留（上次崩溃/退出未消费的）
-  void rt.svc.drainInbox();
-  if (rt.isGateway && rt.channel) void rt.svc.drainOutbox();
+  safeFire(rt.svc.drainInbox(), "drainInbox");
+  if (rt.isGateway && rt.channel) safeFire(rt.svc.drainOutbox(), "drainOutbox");
 }
 
 /** 挂单个 watch；error/失效时自动重建目录并重挂（自愈） */
