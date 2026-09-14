@@ -259,8 +259,10 @@ export async function finalizeRequest(
       );
     }
     // setContent 已入队节流器；release producer 让 SDK completeTerminal() 定格卡片。
-    // 注意 SDK 的 throttle 是异步的，setContent 仅标记最大优先级，由节流器统一 flush。
-    await sleep(300);
+    // 旧实现在这里盲等 sleep(300) 等节流器 flush——实测冗余：SDK 在 producer
+    // resolve 后的 completeTerminal() 本身就会 await throttle.flushNow()
+    // + await queue.drain()，并用 finishStreamingCard(全文) 带上最终内容。
+    // 去掉后每条流式回复少 300ms 固定延迟（关键路径）。
     const resolveProducer = (req as any).resolveProducer as
       | (() => void)
       | undefined;
