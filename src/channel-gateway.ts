@@ -21,7 +21,7 @@ import {
   releaseGatewayLock,
   renewGatewayLock,
 } from "./gateway-lock.ts";
-import { sleep } from "./utils.ts";
+import { sleep, sweepTtlMap } from "./utils.ts";
 
 /** 通道工厂：每次 connect 尝试新建（失败后内部状态可能不干净） */
 export function buildChannel(cfg: FeishuBotConfig) {
@@ -173,12 +173,14 @@ export function startHeartbeat(rt: BotRuntime, ctx: any, pi: any) {
   if (rt.heartbeatTimer) clearInterval(rt.heartbeatTimer);
   rt.heartbeatTimer = setInterval(async () => {
     const { writeInstanceHeartbeat } = await import("./instances.ts");
-    const { drainInbox, drainOutbox } = await import("./mailbox.ts");
     await writeInstanceHeartbeat(rt);
+    // 去重/防重表周期清扫（替代逐条 setTimeout，长稳运行定时器数量恒定）
+    sweepTtlMap(rt.seenMessages, 10 * 60_000);
+    sweepTtlMap(rt.finalizedMessageIds, 30 * 60_000);
     try {
       const lock = await readGatewayLock();
       if (lock && lock.pid === rt.SELF_PID) {
-        // 本实例持锁：续约 + 确保 WS 在线 + 消费发送队列
+        // 本实例持锁：续约 + 确保 WS 在线
         await renewGatewayLock(rt);
         if (!rt.isGateway) rt.isGateway = true;
         if (!rt.channel) {
@@ -202,10 +204,8 @@ export function startHeartbeat(rt: BotRuntime, ctx: any, pi: any) {
     } catch (e: any) {
       console.error("[feishubot] 心跳异常:", e?.message || e);
     }
-    // 锁持有者消费发送队列（工作实例委托的回复）
-    if (rt.isGateway && rt.channel) await drainOutbox(rt);
-    // 网关顺便做死信转移
-    await drainInbox(rt, pi);
+    // 职责去重：drainInbox/drainOutbox 已由 3s 信箱轮询全权负责，
+    // 心跳只做注册续约/锁仲裁/TTL 清扫（含死信接管，drainInbox 内部 60s 降频）
   }, HEARTBEAT_MS);
 }
 

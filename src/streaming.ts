@@ -4,13 +4,51 @@
  * 打字机卡片的关键设计：
  * - producer 保持 pending 直到流结束（提前 resolve 会触发 SDK rollover 产生新卡片）
  * - 占位回执：注入后 ACK_DELAY_MS 仍未出字 → 建占位卡，首个增量原地覆盖
- * - 静默 >15s → setContent 原地更新"仍在执行 Ns"（不堆积消息）
+ * - 静默 >30s → setContent 原地更新"仍在执行 Ns"（不堆积；超长缓冲只追加一行标记）
+ * - 全局令牌桶：多聊天并发打字机共享飞书卡片更新 QPS 预算，防限频恶性循环
+ * - 失败退避：append/setContent 连续失败按指数退避跳轮，finalize 全文兑底最终一致
  * - finalize：setContent 全文定格；失败回落普通回复
  */
 import type { BotRuntime, FeishuRequest } from "./types.ts";
-import { replyMarkdown } from "./sender.ts";
+import { replyMarkdown, sendToChat } from "./sender.ts";
 
 export const STREAM_FLUSH_MS = 700;
+
+// ======== 全局卡片更新令牌桶（P0：多会话并发共享飞书 QPS 预算）========
+// 飞书按 app 维度限频：N 个聊天同时流式时 700ms/请求的刷新会叠加触发限频，
+// 限频失败又诱发全文重发 → 恶性循环。令牌桶让所有卡片更新排队共享 ~1.5 QPS。
+const CARD_BUCKET_CAPACITY = 3;
+const CARD_REFILL_MS = 650; // 稳态 ≈ 1.5 次/秒
+let cardTokens = CARD_BUCKET_CAPACITY;
+let cardLastRefillAt = Date.now();
+
+function refillCardTokens() {
+  const now = Date.now();
+  const n = Math.floor((now - cardLastRefillAt) / CARD_REFILL_MS);
+  if (n > 0) {
+    cardTokens = Math.min(CARD_BUCKET_CAPACITY, cardTokens + n);
+    cardLastRefillAt += n * CARD_REFILL_MS;
+  }
+}
+
+/** 取一个卡片更新额度（额度不足时等待），用于流式 append / 心跳 setContent；
+ *  finalize 定格不经过桶（关键路径优先） */
+async function acquireCardSlot() {
+  for (;;) {
+    refillCardTokens();
+    if (cardTokens > 0) {
+      cardTokens--;
+      return;
+    }
+    await sleep(150);
+  }
+}
+
+// 静默心跳策略：全文重发从 15s 放宽到 30s；超长缓冲只追加一行耗时标记
+// （全文 setContent 是 O(n²) 字节 + 高 QPS 消耗；标记行会被 finalize 全文覆盖）
+const SILENT_HEARTBEAT_MS = 30_000;
+const SILENT_FULLTEXT_MAX = 20_000;
+const STREAM_BACKOFF_MAX_MS = 8_000;
 
 /**
  * 占位回执：注入后 ACK_DELAY_MS 仍未出字 → 提前建卡显示"正在处理"，
@@ -45,6 +83,7 @@ export function scheduleAck(rt: BotRuntime, req: FeishuRequest) {
       }
       const sec = Math.round((Date.now() - started) / 1000);
       try {
+        await acquireCardSlot();
         await req.streamCtrl.setContent(`🫥 仍在运行… 累计 ${sec}s`);
       } catch (e) {
         void e; // 占位心跳更新失败 → 下一轮重试
@@ -73,55 +112,94 @@ export function ensureStream(
     if (req.streamPlaceholder) {
       void ctrl.setContent(req.streamPlaceholder).catch(() => {});
     }
-    // flush 循环：把 buffer 增量推给卡片
+    // flush 循环：把 buffer 增量推给卡片（令牌桶限速 + 失败指数退避 + 在途互斥）
     req.streamFlushTimer = setInterval(async () => {
       if (req.finalized || !req.streamCtrl) return;
-      const buf = req.streamBuffer;
-      // 运行心跳：静默超过 15s → 用 setContent 原地更新"已运行 Ns"（同一行，不堆积）；
-      // finalize 时 setContent 全文覆盖，心跳行不会留在最终结果里
-      const activityBase = req.lastActivityAt || req.startedAtMs || Date.now();
-      const silentMs = Date.now() - activityBase;
-      const runSec = Math.round(
-        (Date.now() - (req.startedAtMs || activityBase)) / 1000,
-      );
-      if (
-        buf.length === req.streamAppended &&
-        req.streamAppended > 0 &&
-        silentMs > 15_000
-      ) {
-        try {
-          await req.streamCtrl.setContent(
-            `${buf}\n\n⏱ 仍在执行，累计 ${runSec}s…`,
-          );
-          req.lastActivityAt = Date.now();
-        } catch (e) {
-          void e; // 心跳更新失败 → 下轮 flush 重试
-        }
-        return;
-      }
-      if (buf.length > req.streamAppended) {
-        // 占位卡首刷：setContent 全量覆盖"正在处理"占位文本
-        if (req.streamPlaceholder) {
-          req.streamPlaceholder = null;
-          req.streamAppended = buf.length;
+      // 在途互斥：上轮还在等桶/网络时跳过本轮，防重入叠加
+      if (req.streamFlushInFlight) return;
+      req.streamFlushInFlight = true;
+      try {
+        // 失败退避中：本轮跳过，防限频恶性循环
+        if ((req.streamNextAttemptAt || 0) > Date.now()) return;
+        const buf = req.streamBuffer;
+        // 运行心跳：静默超过 30s → 用 setContent 原地更新"已运行 Ns"（同一行，不堆积）；
+        // 超长缓冲只追加一行耗时标记（全文重发是 O(n²) 字节）；
+        // finalize 时 setContent 全文覆盖，心跳行不会留在最终结果里
+        const activityBase = req.lastActivityAt || req.startedAtMs || Date.now();
+        const silentMs = Date.now() - activityBase;
+        const runSec = Math.round(
+          (Date.now() - (req.startedAtMs || activityBase)) / 1000,
+        );
+        if (
+          buf.length === req.streamAppended &&
+          req.streamAppended > 0 &&
+          silentMs > SILENT_HEARTBEAT_MS
+        ) {
           try {
-            await req.streamCtrl.setContent(buf);
+            await acquireCardSlot();
+            if (buf.length <= SILENT_FULLTEXT_MAX) {
+              await req.streamCtrl.setContent(
+                `${buf}\n\n⏱ 仍在执行，累计 ${runSec}s…`,
+              );
+            } else {
+              await req.streamCtrl.append(`\n\n⏱ 仍在执行，累计 ${runSec}s…`);
+            }
+            req.lastActivityAt = Date.now();
           } catch (e) {
-            void e; // 首刷失败 → 退回增量 append 路径
+            void e;
+            // 心跳更新失败 → 同样计入失败退避，防限频时空转重试
+            req.streamFailCount = (req.streamFailCount || 0) + 1;
+            req.streamNextAttemptAt =
+              Date.now() +
+              Math.min(
+                STREAM_FLUSH_MS * 2 ** (req.streamFailCount || 1),
+                STREAM_BACKOFF_MAX_MS,
+              );
           }
           return;
         }
-        const chunk = buf.slice(req.streamAppended);
-        req.streamAppended = buf.length;
-        try {
-          await req.streamCtrl.append(chunk);
-        } catch {
+        if (buf.length > req.streamAppended) {
+          // 占位卡首刷：setContent 全量覆盖"正在处理"占位文本
+          if (req.streamPlaceholder) {
+            req.streamPlaceholder = null;
+            req.streamAppended = buf.length;
+            try {
+              await req.streamCtrl.setContent(buf);
+            } catch (e) {
+              void e; // 首刷失败 → 退回增量 append 路径
+            }
+            return;
+          }
+          const chunk = buf.slice(req.streamAppended);
+          const appendedBefore = req.streamAppended;
+          req.streamAppended = buf.length;
           try {
-            await req.streamCtrl.setContent(buf);
-          } catch (e) {
-            void e; // flush 失败 → 下轮重试
+            await acquireCardSlot();
+            await req.streamCtrl.append(chunk);
+            req.streamFailCount = 0;
+          } catch {
+            // append 失败 → 全文 setContent 兑底（同样受限流桶约束）
+            try {
+              await acquireCardSlot();
+              await req.streamCtrl.setContent(buf);
+              req.streamFailCount = 0;
+            } catch (e) {
+              void e;
+              // 双失败：回退水位到断点 + 指数退避，下轮从断点重试
+              // （finalize 全文 setContent 兑底保证最终一致性）
+              req.streamAppended = appendedBefore;
+              req.streamFailCount = (req.streamFailCount || 0) + 1;
+              req.streamNextAttemptAt =
+                Date.now() +
+                Math.min(
+                  STREAM_FLUSH_MS * 2 ** (req.streamFailCount || 1),
+                  STREAM_BACKOFF_MAX_MS,
+                );
+            }
           }
         }
+      } finally {
+        req.streamFlushInFlight = false;
       }
     }, STREAM_FLUSH_MS);
     return new Promise<void>((resolve) => {
@@ -217,13 +295,15 @@ const PROGRESS_TICK_MS = 30_000; // 30s 节流
 const PROGRESS_MAX_SENDS = 20; // 单请求上限，防刷屏
 
 /**
- * worker 进度播报：每 30s 经 send-only 通道播报当前工具/阶段 + 累计耗时。
- * 网关实例有流式卡片（streamCtrl），自动跳过避免双重噪音。
+ * worker 进度播报（安静版）：仅在「有真实工具活动且工具发生变化」时播报一条，
+ * 纯思考 / 生成回答阶段不发消息（用户要求：过程中的“思考/生成回答中”属噪声，
+ * 等最终回复即可）。网关实例有流式卡片（streamCtrl），整个机制自动跳过。
  */
 export function startProgressNotifier(rt: BotRuntime, req: FeishuRequest) {
   if (req.progressTimer) return;
   if (rt.channel) return; // 网关：有打字机卡片，无需文本播报
   req.progressSent = 0;
+  req.progressLastSig = "";
   req.progressTimer = setInterval(async () => {
     if (req.finalized) {
       stopProgressNotifier(req);
@@ -233,10 +313,15 @@ export function startProgressNotifier(rt: BotRuntime, req: FeishuRequest) {
       stopProgressNotifier(req);
       return;
     }
+    const info = rt.activeToolInfo;
+    // 无工具活动 = 思考/生成中 → 静默（不发任何消息）
+    if (!info) return;
     const sec = Math.round((Date.now() - (req.startedAtMs || Date.now())) / 1000);
-    const tool = rt.activeToolInfo
-      ? `正在执行 \`${rt.activeToolInfo.name}\`${rt.activeToolInfo.argsSummary ? ` (${rt.activeToolInfo.argsSummary})` : ""}`
-      : "思考 / 生成回答中";
+    const sig = `${info.name}|${info.argsSummary}`;
+    // 同一工具持续执行 → 不重复刷屏
+    if (sig === req.progressLastSig) return;
+    req.progressLastSig = sig;
+    const tool = `正在执行 \`${info.name}\`${info.argsSummary ? ` (${info.argsSummary})` : ""}`;
     try {
       await sendToChat(rt, req.chatId, `⏳ [${sec}s] ${tool}`);
       req.progressSent++;

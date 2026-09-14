@@ -8,6 +8,7 @@
 import type { BotRuntime } from "./types.ts";
 
 const POLL_MS = 30_000;
+const MAX_POLL_MS = 300_000; // daemon 不在时退避封顶 5min（避免每 30s 空扫 16 个端口）
 const NOTIFY_STATUSES = new Set(["completed", "failed", "degraded"]);
 const STATUS_LABEL: Record<string, string> = {
   completed: "✅ 已完成",
@@ -28,14 +29,33 @@ interface TaskRow {
 
 const snapshot = new Map<string, string>();
 let primed = false;
+/** 上次成功的 daemon 地址：优先探活，避免每轮全端口扫描 */
+let cachedBase: string | null = null;
+/** 当前轮询间隔（daemon 不在时指数退避，恢复后回 POLL_MS） */
+let pollDelay = POLL_MS;
 
 async function daemonBase(): Promise<string | null> {
+  // 记住上次成功端口优先探活（O(1)）；失效再全扫
+  if (cachedBase) {
+    try {
+      const r = await fetch(`${cachedBase}/healthz`, {
+        signal: AbortSignal.timeout(800),
+      });
+      if (r.ok) return cachedBase;
+    } catch {
+      void 0; // 缓存端口已失效 → 重新扫描
+    }
+    cachedBase = null;
+  }
   for (let port = 7900; port <= 7919; port++) {
     try {
       const r = await fetch(`http://127.0.0.1:${port}/healthz`, {
         signal: AbortSignal.timeout(800),
       });
-      if (r.ok) return `http://127.0.0.1:${port}`;
+      if (r.ok) {
+        cachedBase = `http://127.0.0.1:${port}`;
+        return cachedBase;
+      }
     } catch {
       void 0; // 端口未开 → 下一个
     }
@@ -74,13 +94,18 @@ async function notifyTask(rt: BotRuntime, t: TaskRow) {
   }
 }
 
-/** 启动任务监听（仅网关实例调用；非网关 no-op） */
+/** 启动任务监听（仅网关实例调用；非网关 no-op）。setTimeout 链驱动，支持动态退避 */
 export function startTaskWatcher(rt: BotRuntime) {
   if (!rt.isGateway || rt.taskWatcherTimer) return;
-  rt.taskWatcherTimer = setInterval(async () => {
+  const tick = async () => {
     try {
       const base = await daemonBase();
-      if (!base) return;
+      if (!base) {
+        // daemon 不在：指数退避（30s→60s→…→5min），空转成本降至可忽略
+        pollDelay = Math.min(pollDelay * 2, MAX_POLL_MS);
+        return;
+      }
+      pollDelay = POLL_MS;
       const r = await fetch(`${base}/api/tasks`);
       if (!r.ok) return;
       const d = (await r.json()) as { tasks?: TaskRow[] };
@@ -108,13 +133,19 @@ export function startTaskWatcher(rt: BotRuntime) {
     } catch (e) {
       void e; // 轮询失败 → 下轮重试
     }
-  }, 30_000);
+    // 本轮结束后按当前节奏排下一轮（stop 置空 timer 则不再排）
+    if (rt.taskWatcherTimer !== null) {
+      rt.taskWatcherTimer = setTimeout(tick, pollDelay);
+    }
+  };
+  rt.taskWatcherTimer = setTimeout(tick, pollDelay);
 }
 
 export function stopTaskWatcher(rt: BotRuntime) {
   if (rt.taskWatcherTimer) {
-    clearInterval(rt.taskWatcherTimer);
+    clearTimeout(rt.taskWatcherTimer);
     rt.taskWatcherTimer = null;
   }
   primed = false;
+  pollDelay = POLL_MS;
 }

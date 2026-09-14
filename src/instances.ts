@@ -24,6 +24,15 @@ export function currentSessionFile(rt: BotRuntime): string {
   );
 }
 
+/** 存活实例表短 TTL 缓存：单条消息链路会触发 2~4 次查询，避免重复 readdir+逐文件读 */
+let liveCache: { at: number; list: InstanceInfo[] } | null = null;
+const LIVE_CACHE_TTL_MS = 2500;
+
+/** 实例表变更（心跳写入/注销）后主动失效，保证自身状态立即可见 */
+export function invalidateInstanceCache() {
+  liveCache = null;
+}
+
 export async function writeInstanceHeartbeat(rt: BotRuntime) {
   if (!existsSync(INSTANCES_DIR)) {
     await mkdir(INSTANCES_DIR, { recursive: true }).catch(() => {});
@@ -36,15 +45,18 @@ export async function writeInstanceHeartbeat(rt: BotRuntime) {
     startedAt: rt.startedAt,
     heartbeat: Date.now(),
   };
+  // 紧凑序列化（高频写，pretty-print 纯浪费字节）
   await writeFile(
     join(INSTANCES_DIR, `${rt.SELF_PID}.json`),
-    JSON.stringify(info, null, 2),
+    JSON.stringify(info),
   ).catch(() => {});
+  invalidateInstanceCache();
 }
 
-/** 列出存活实例（心跳新鲜）；顺带清理僵尸注册文件 */
+/** 列出存活实例（心跳新鲜）；顺带清理僵尸注册文件。opts.fresh 跳过缓存 */
 export async function listLiveInstances(
   rt: BotRuntime,
+  opts: { fresh?: boolean } = {},
 ): Promise<InstanceInfo[]> {
   const out: InstanceInfo[] = [];
   try {
@@ -66,7 +78,9 @@ export async function listLiveInstances(
   } catch (e) {
     void e; // 注册目录不存在 → 空列表
   }
-  return out.sort((a, b) => a.startedAt - b.startedAt || a.pid - b.pid);
+  const list = out.sort((a, b) => a.startedAt - b.startedAt || a.pid - b.pid);
+  liveCache = { at: Date.now(), list };
+  return list;
 }
 
 /** 网关选举：存活实例中 startedAt 最早者 */
