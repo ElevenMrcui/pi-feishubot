@@ -37,9 +37,16 @@ export function createReloadCommand(rt: BotRuntime, pi: any): FastCommand {
           if (ctxAny && typeof ctxAny.reload === "function") {
             await ctxAny.reload();
           } else {
-            await pi.sendUserMessage(
-              [{ type: "text", text: "/feishubot-reload" }],
-              { expandPromptTemplates: true } as any,
+            // 不得向会话注入 /feishubot-reload：该 prompt 模板本仓并不存在，注入等于
+            // 把命令文本当提示词喂给 LLM（它会开始“回答”这条指令）。
+            // ctx.reload 是 pi 稳定 API，缺失只可能是上下文已失效 → 只提示手操。
+            console.error(
+              "[feishubot] ctx.reload 不可用（上下文已失效？），跳过重载",
+            );
+            await replyMarkdown(
+              rt,
+              req,
+              "⚠️ 重载上下文不可用（实例可能刚切换过会话），请在终端里执行 `/reload`",
             );
           }
         } catch (e: any) {

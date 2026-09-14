@@ -45,7 +45,11 @@ function tagRouteHandler(rt: BotRuntime): RouteHandler {
     }
     if (inst.pid === rt.SELF_PID) {
       // 就是自己：标记本地落地，跳过后续绑定路由（否则 @网关标签会被错误地
-      // 按绑定表再投给其它实例），直接走本地快捷指令/注入
+      // 按绑定表再投给其它实例），直接走本地快捷指令/注入。
+      // 必须剥离路由前缀后再落地：指令正则按整句匹配，`@faunet 实例` 不剥标签
+      // 就匹配不到任何指令 → 会被当普通提示词注入 LLM（实测穿透）
+      rc.text = msgText;
+      rc.lower = msgText.trim().toLowerCase();
       rc.routeToLocal = true;
       return false;
     }

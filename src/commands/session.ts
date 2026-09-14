@@ -188,6 +188,19 @@ export function createSwitchSessionCommand(
 
 // ---------------------------------------------------------------- 绑定会话
 
+/** 本实例当前会话的绑定目标兼容对象（裸「绑定我」时使用，
+ *  字段对齐 resolveSessionTarget 的返回，避免下游取 name/id 时报错） */
+function selfSessionTarget(rt: BotRuntime): any | null {
+  const path = currentSessionFile(rt);
+  if (!path) return null;
+  const base = path.split("/").pop() || "";
+  return {
+    path,
+    id: base.replace(/\.jsonl$/, "").split("_").slice(1).join("_") || base,
+    name: rt.sessionName || "",
+  };
+}
+
 export function createBindSessionCommand(rt: BotRuntime): FastCommand {
   return {
     name: "bind-session",
@@ -195,7 +208,16 @@ export function createBindSessionCommand(rt: BotRuntime): FastCommand {
     match: (text) => SESSION_BIND_RE.test(text.trim()),
     async execute(req, text) {
       const bindSession = text.trim().match(SESSION_BIND_RE)!;
-      const arg = bindSession[1].trim();
+      const arg = (bindSession[1] || "").trim();
+      if (!arg) {
+        // 指令族文本绝不注入 LLM：LLM 执行不了路由，只会编一个回答
+        await replyMarkdown(
+          rt,
+          req,
+          "用法：`绑定会话 <序号/会话ID/关键词>`（发 `会话` 查看列表；绑定到本实例当前会话发 `绑定我`）",
+        );
+        return true;
+      }
       const target = await resolveSessionTarget(rt, arg);
       if (!target) {
         await replyMarkdown(
@@ -290,8 +312,16 @@ export function createBindMeCommand(rt: BotRuntime): FastCommand {
     match: (text) => SESSION_BIND_ME_RE.test(text.trim()),
     async execute(req, text) {
       const bindMe = text.trim().match(SESSION_BIND_ME_RE)!;
-      const arg = bindMe[1].trim();
-      const target = await resolveSessionTarget(rt, arg);
+      const arg = (bindMe[1] || "").trim();
+      let target = arg ? await resolveSessionTarget(rt, arg) : null;
+      if (!arg) {
+        // 裸「绑定我」= 绑定到本实例当前会话：先按会话名走统一解析器（拿完整
+        // 元数据），解析不到再用当前 sessionFile 兜底合成
+        target =
+          (rt.sessionName
+            ? await resolveSessionTarget(rt, rt.sessionName)
+            : null) || selfSessionTarget(rt);
+      }
       if (!target) {
         await replyMarkdown(
           rt,

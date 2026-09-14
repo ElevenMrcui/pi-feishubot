@@ -26,12 +26,16 @@ export const RELOAD_RE =
   /^\/?(reload(es|ed|s?)|rwload|relaod|rewload|relode)$/i;
 /** 切换会话：`切会话 3` / `切会话 <session文件名或id片段>` / `/session 3` / `/sessions 3` */
 export const SESSION_SWITCH_RE = /^(?:切会话|切换会话|\/sessions?)\s+(.+)$/i;
-/** 会话路由绑定：`绑定会话 <序号/ID/关键词>`（聊天级：整个聊天的消息都路由） */
-export const SESSION_BIND_RE = /^(?:绑定会话|会话绑定|bind)\s+(.+)$/i;
+/** 会话路由绑定：`绑定会话 <序号/ID/关键词>`（聊天级），兼容口语别名 `绑定实例 X`。
+ *  参数可选：裸 `绑定会话` 由指令回用法提示，不得穿透给 LLM（LLM 无法执行
+ *  路由指令，只会凭文本瞎编一个回答） */
+export const SESSION_BIND_RE =
+  /^(?:绑定会话|会话绑定|绑定实例|bind)(?:\s+(.+))?$/i;
 /** 解除绑定：`解绑会话` */
 export const SESSION_UNBIND_RE = /^(?:解绑会话|unbind)$/i;
-/** 发送方级绑定：`绑定我 <关键词>` —— 群里只把「我」的消息路由到指定会话 */
-export const SESSION_BIND_ME_RE = /^(?:绑定我|bind\s*me)\s+(.+)$/i;
+/** 发送方级绑定：`绑定我 [关键词]` —— 群里只把「我」的消息路由到指定会话；
+ *  不带参数即绑定到本实例当前会话 */
+export const SESSION_BIND_ME_RE = /^(?:绑定我|bind\s*me)(?:\s+(.+))?$/i;
 /** 解除发送方级绑定：`解绑我` */
 export const SESSION_UNBIND_ME_RE = /^(?:解绑我|unbind\s*me)$/i;
 /** 启动实例：`启动实例 <目录> [恢复]` */
