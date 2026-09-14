@@ -11,8 +11,9 @@
  * 3. fs.watch 静默失效（macOS FSEvents 已实测）→ error 自动重挂 + 3s 兜底轮询
  */
 import { readFile, writeFile, mkdir, readdir, rm, rename } from "node:fs/promises";
-import { join } from "node:path";
-import { existsSync, watch as fsWatch } from "node:fs";
+import { join, dirname } from "node:path";
+import { existsSync, watch as fsWatch, rmSync, mkdirSync } from "node:fs";
+import { createConnection, createServer, type Server } from "node:net";
 import { INBOX_ROOT } from "./storage.ts";
 import type { BotRuntime, FeishuRequest, InstanceInfo } from "./types.ts";
 import { listLiveInstances } from "./instances.ts";
@@ -29,6 +30,100 @@ const PROBE_TOLERANCE_MS = 4_000;
 // （消息投递路径不依赖它：直接写给存活实例的信箱照常即时消费）
 let lastTakeoverScanAt = 0;
 const TAKEOVER_SCAN_INTERVAL_MS = 60_000;
+
+// ---------------------------------------------------------------- 跨实例唤醒通道
+
+/**
+ * 写完信件/代发件后通知目标实例立即 drain，把信箱投递延迟从最坏 3s 降到 ~3ms。
+ *
+ * 设计：每实例一个 Unix domain socket（inbox/{pid}/wake.sock），无需端口协商、
+ * 天然按实例隔离。notifyWake 尽力而为：失败/无 socket 一律静默，3s 轮询始终
+ * 作为兜底防线（语义上 socket 只是加速器，不是正确性依赖）。
+ */
+export function wakeSocketPath(pid: number) {
+  return join(INBOX_ROOT, String(pid), "wake.sock");
+}
+
+let wakeServer: Server | null = null;
+
+/** 通知目标实例“有活了”（fire-and-forget，错误吐掉由轮询兜底） */
+export function notifyWake(pid: number): void {
+  if (!pid) return;
+  const path = wakeSocketPath(pid);
+  if (!existsSync(path)) return; // 目标未监听 → 靠 3s 轮询
+  try {
+    const sock = createConnection({ path }, () => {
+      try {
+        sock.write("1");
+      } catch (e) {
+        void e;
+      }
+      sock.destroy();
+    });
+    sock.setTimeout(500, () => sock.destroy());
+    sock.on("error", () => sock.destroy()); // 目标已死/竞态 → 忽略
+  } catch (e) {
+    void e;
+  }
+}
+
+function wakeNow(rt: BotRuntime) {
+  // 正在消化 → 250ms 后补一轮，消除“信件落在本次 drain 扫描之后”的竞态
+  if (rt.draining || rt.outboxDraining) {
+    setTimeout(() => wakeNow(rt), 250).unref?.();
+    return;
+  }
+  safeFire(rt.svc.drainInbox(), "drainInbox:wake");
+  if (rt.isGateway && rt.channel)
+    safeFire(rt.svc.drainOutbox(), "drainOutbox:wake");
+}
+
+export function startWakeListener(rt: BotRuntime) {
+  if (wakeServer) return;
+  const path = wakeSocketPath(rt.SELF_PID);
+  try {
+    // 首次启动时 ensureDirsAndWatch 是异步的（fire-and-forget），socket 路径
+    // 所在目录必须已存在，否则 listen 直接 ENOENT → 唤醒能力永久丢失
+    mkdirSync(dirname(path), { recursive: true });
+    // 上次进程异常退出（kill/崩）遗留的 socket 会让 listen 直接 EADDRINUSE
+    if (existsSync(path)) rmSync(path, { force: true });
+  } catch (e) {
+    void e;
+  }
+  try {
+    const srv = createServer(() => wakeNow(rt));
+    srv.on("error", (e: any) => {
+      console.warn(
+        `[feishubot] 唤醒 socket 不可用，退回 3s 轮询（${e?.code || e?.message}）`,
+      );
+      wakeServer = null;
+    });
+    srv.listen(path);
+    wakeServer = srv;
+  } catch (e: any) {
+    console.warn(
+      `[feishubot] 唤醒 socket 启动失败，退回 3s 轮询（${e?.message}）`,
+    );
+    wakeServer = null;
+  }
+}
+
+export function stopWakeListener(rt: BotRuntime) {
+  if (wakeServer) {
+    try {
+      wakeServer.close();
+    } catch (e) {
+      void e;
+    }
+    wakeServer = null;
+  }
+  try {
+    const path = wakeSocketPath(rt.SELF_PID);
+    if (existsSync(path)) rmSync(path, { force: true });
+  } catch (e) {
+    void e;
+  }
+}
 
 /** 安全投递：异步操作永不冒泡为 unhandledRejection（feishubot 不得崩掉 pi 宿主） */
 function safeFire(p: Promise<unknown>, label: string) {
@@ -56,6 +151,7 @@ export async function delegateSend(
     `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`,
   );
   await writeFile(file, JSON.stringify({ kind: "send", chatId, md }));
+  notifyWake(gatewayPid); // 唤醒网关立即代发（否则最坏等 1s 心跳/3s 轮询）
 }
 
 /** 把飞书消息投递到目标实例的信箱（投递前校验目标存活） */
@@ -85,6 +181,7 @@ export async function routeToInstance(
     file,
     JSON.stringify({ ...payload, toPid: target.pid, ts: Date.now() }),
   );
+  notifyWake(target.pid); // 唤醒目标实例：投递延迟 3s → ~3ms
 }
 
 /** 信箱文件入口：读内容 → 删文件（拿所有权）→ 纯处理（毒丸不循环） */
@@ -289,6 +386,7 @@ export async function drainOutbox(rt: BotRuntime) {
  */
 export function startInboxWatcher(rt: BotRuntime) {
   safeFire(ensureDirsAndWatch(rt), "ensureDirsAndWatch");
+  startWakeListener(rt);
   if (!rt.mailboxPollTimer) {
     rt.mailboxPollTimer = setInterval(() => {
       safeFire(rt.svc.drainInbox(), "drainInbox");
@@ -305,6 +403,7 @@ export function startInboxWatcher(rt: BotRuntime) {
 
 /** 停止信箱监听（探针 + watcher；session_shutdown 用） */
 export function stopInboxWatcher(rt: BotRuntime) {
+  stopWakeListener(rt);
   if (probeTimer) {
     clearInterval(probeTimer);
     probeTimer = null;
