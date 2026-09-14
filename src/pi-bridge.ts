@@ -14,13 +14,13 @@ import { watch as _fsWatch } from "node:fs";
 import { mkdir as _mkdir } from "node:fs/promises";
 import { join as _join } from "node:path";
 import { homedir as _homedir } from "node:os";
-import type { BotRuntime } from "./types.ts";
+import type { BotRuntime, FeishuRequest, PendingReply } from "./types.ts";
 import { finalizeRequest, ensureStream, stopProgressNotifier } from "./streaming.ts";
 import { sendReplyOut } from "./sender.ts";
 import { summarizeArgs } from "./utils.ts";
 import { readBindings } from "./storage.ts";
 import { writeInstanceHeartbeat } from "./instances.ts";
-import { startInboxWatcher, drainInbox } from "./mailbox.ts";
+import { startInboxWatcher, drainInbox, stopInboxWatcher } from "./mailbox.ts";
 import {
   connect,
   disconnect,
@@ -34,10 +34,9 @@ import { loadConfig, saveConfig, deleteConfig } from "./storage.ts";
 // 事件订阅
 // ========================================================================
 
-/** finalizedMessageIds 带 30min TTL（防长期运行内存泄漏） */
+/** finalizedMessageIds 带 TTL（30min，心跳周期清扫；防长期运行内存泄漏） */
 function markFinalized(rt: BotRuntime, id: string) {
-  rt.finalizedMessageIds.add(id);
-  setTimeout(() => rt.finalizedMessageIds.delete(id), 30 * 60 * 1000);
+  rt.finalizedMessageIds.set(id, Date.now());
 }
 
 /** 安全投递：异步失败仅记日志，绝不冒泡（feishubot 不崩宿主） */
@@ -78,6 +77,14 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
 
   pi.on("before_agent_start", () => {
     rt.activeToolInfo = null;
+    // 新 run 启动 = 上一个 agent_end 属中途态：暂停延投轮询（不把半程叙述当最终回复发出）
+    for (const p of rt.pendingReplies.values()) {
+      if (p.timer) {
+        clearTimeout(p.timer);
+        p.timer = null;
+      }
+      p.expiresAt = Math.max(p.expiresAt, Date.now() + PENDING_EXPIRE_MS);
+    }
   });
 
   pi.on("agent_end", async (e: any) => {
@@ -184,6 +191,10 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
       req.finalized = true;
       if (req.streamFlushTimer) clearInterval(req.streamFlushTimer);
     }
+    for (const p of rt.pendingReplies.values()) {
+      if (p.timer) clearTimeout(p.timer);
+    }
+    rt.pendingReplies.clear();
     rt.requests.clear();
     rt.activeRequest = null;
     if (rt.heartbeatTimer) clearInterval(rt.heartbeatTimer);
@@ -192,18 +203,7 @@ export function registerPiObservers(rt: BotRuntime, pi: any) {
     rt.mailboxPollTimer = null;
     const { stopTaskWatcher } = await import("./task-watcher.ts");
     stopTaskWatcher(rt);
-    try {
-      rt.inboxWatcher?.close();
-    } catch (e) {
-      void e; // watcher 未初始化
-    }
-    rt.inboxWatcher = null;
-    try {
-      rt.outboxWatcher?.close();
-    } catch (e) {
-      void e; // watcher 未初始化
-    }
-    rt.outboxWatcher = null;
+    stopInboxWatcher(rt);
     await teardown(rt);
     disconnect(rt);
   });
@@ -249,40 +249,116 @@ async function pairAndDeliverReplies(rt: BotRuntime, messages: any[]) {
       }
     }
     let content = parts.join("\n\n").trim();
+    // 工具轮次本回合无文本 → 优先用流式已缓冲的内容
+    if (!content && req?.streamBuffer?.trim())
+      content = req.streamBuffer.trim();
 
-    // 3. 防早夭/防误报核心：
-    // 大模型执行工具调用（如 bash/read/edit）期间，assistant 消息只含 toolCall，text 为空。
-    // 若此时触发 agent_end（多 turn 切换时），如果 agent 还没真正空闲，绝不能提早定格！
-    if (!content) {
-      // 如果卡片在流式过程中已经缓冲了文本，优先采用流式 buffer
-      if (req && req.streamBuffer && req.streamBuffer.trim()) {
-        content = req.streamBuffer.trim();
-      } else if (rt.currentCtx && !rt.currentCtx.isIdle()) {
-        // 任务还在进行中（工具调用中），静默等待后续轮次产出文本
-        continue;
-      }
-    }
-
-    // 4. 如果任务确实彻底结束，但依然没有任何文本：
-    if (!content) {
+    // 3. 防早夭（v2.2.9）：agent_end ≠ 已空闲 —— agent_end 之后 pi 会对长会话
+    //    自动压缩（isCompacting）、bai failover 也会排队续跑，两种情况下
+    //    isIdle() 均为 false。v2.2.8 在此直接 continue 会把回复永久丢弃
+    //    （真实事故：重载后回复全丢，进度播报跑到 600s 上限）。
+    //    正确做法：挂起延投 —— 空闲后补投最新内容，超时兜底必投。
+    if (rt.currentCtx && !rt.currentCtx.isIdle()) {
       if (!req) {
-        // 历史孤儿消息，坚决不向飞书补发无意义的告警
+        // 历史孤儿消息（本运行时未跟踪，如重载前旧轮次）：不补发防刷屏
         markFinalized(rt, messageId);
         continue;
       }
+      stashPendingReply(rt, messageId, chatId, req, content);
+      continue;
+    }
+    deletePendingReply(rt, messageId); // 已空闲：立即投递，撤销挂起
+
+    // 4. 彻底结束但仍无文本：补兜底文案
+    if (!content) {
       content = "⚠️ 任务已结束，但未产生回复文本。";
     }
 
     // 5. 正式定格或发送
-    markFinalized(rt, messageId);
-    rt.stats.replied++;
-    if (req && !req.viaInbox) {
-      await finalizeRequest(rt, req, content);
-    } else {
-      // 跨实例投递的消息（或无上下文）：先停进度播报，再走回复出口（直发/委托网关）
-      if (req) stopProgressNotifier(req);
-      await sendReplyOut(rt, chatId, content);
+    await deliverReply(rt, messageId, chatId, req, content);
+  }
+}
+
+// ========================================================================
+// 延投队列（agent_end 时未空闲：自动压缩 / failover 续跑）
+// ========================================================================
+
+const PENDING_POLL_MS = 2_000;
+const PENDING_EXPIRE_MS = 180_000;
+
+function stashPendingReply(
+  rt: BotRuntime,
+  messageId: string,
+  chatId: string,
+  req: FeishuRequest,
+  content: string,
+) {
+  const prev = rt.pendingReplies.get(messageId);
+  // 保留最长（= 最完整）的一份：failover 续跑后最后轮次会补齐全文
+  const merged =
+    content.length >= (prev?.content.length ?? 0)
+      ? content
+      : (prev as PendingReply).content;
+  if (prev?.timer) clearTimeout(prev.timer);
+  const pending: PendingReply = {
+    messageId,
+    chatId,
+    req,
+    content: merged,
+    stashedAt: prev?.stashedAt || Date.now(),
+    expiresAt: Date.now() + PENDING_EXPIRE_MS,
+    timer: null,
+  };
+  rt.pendingReplies.set(messageId, pending);
+  ensurePendingPoll(rt, pending);
+}
+
+function deletePendingReply(rt: BotRuntime, messageId: string) {
+  const p = rt.pendingReplies.get(messageId);
+  if (p?.timer) clearTimeout(p.timer);
+  rt.pendingReplies.delete(messageId);
+}
+
+/** 轮询补投：空闲即投，超时兜底（保证“至少收到一条”）；run 重启时由
+ *  before_agent_start 暂停，避免把半程叙述当最终回复发出 */
+function ensurePendingPoll(rt: BotRuntime, p: PendingReply) {
+  if (p.timer) return;
+  const tick = () => {
+    p.timer = null;
+    const cur = rt.pendingReplies.get(p.messageId);
+    if (!cur || cur !== p) return; // 已由空闲路径投递
+    const idle = !rt.currentCtx || rt.currentCtx.isIdle?.() !== false;
+    if (!idle && Date.now() < p.expiresAt) {
+      p.timer = setTimeout(tick, PENDING_POLL_MS);
+      return;
     }
+    rt.pendingReplies.delete(p.messageId);
+    void deliverReply(rt, p.messageId, p.chatId, p.req, p.content).catch(
+      (e: any) => console.error("[feishubot] 延投失败:", e?.message || e),
+    );
+  };
+  p.timer = setTimeout(tick, PENDING_POLL_MS);
+}
+
+/** 回复投递唯一出口（定格流式卡片 / 直发或委托网关），同步与延投共用 */
+async function deliverReply(
+  rt: BotRuntime,
+  messageId: string,
+  chatId: string,
+  req: FeishuRequest | undefined,
+  content: string,
+): Promise<void> {
+  if (rt.finalizedMessageIds.has(messageId)) return;
+  markFinalized(rt, messageId);
+  if (req) req.finalized = true;
+  rt.stats.replied++;
+  const text = content.trim() || "⚠️ 任务已结束，但未产生回复文本。";
+  if (req && !req.viaInbox) {
+    await finalizeRequest(rt, req, text);
+  } else {
+    // 跨实例投递的消息（无流式卡片）：先停进度播报，再走回复出口
+    if (req) stopProgressNotifier(req);
+    await sendReplyOut(rt, chatId, text);
   }
 }
 

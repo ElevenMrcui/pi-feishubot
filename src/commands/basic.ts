@@ -6,6 +6,7 @@
  */
 import type { BotRuntime, FastCommand } from "../types.ts";
 import { replyMarkdown } from "../sender.ts";
+import { BOT_VERSION } from "../runtime.ts";
 
 // ---------------------------------------------------------------- 帮助
 
@@ -101,6 +102,7 @@ export function createStatusCommand(rt: BotRuntime): FastCommand {
       }
       const lines = [
         "### 🤖 Pi 运行状态",
+        `- **feishubot**: v${BOT_VERSION}`,
         `- **状态**: ${busy ? "● 执行中" : "○ 空闲"}`,
         `- **模型**: \`${model?.id || "默认"}\` (${model?.provider || "未知"})`,
         `- **上下文**: ${usage}`,

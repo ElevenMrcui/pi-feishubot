@@ -206,6 +206,12 @@ export function createBindSessionCommand(rt: BotRuntime): FastCommand {
         return true;
       }
       rt.chatBindings[req.chatId] = target.path;
+      // 聊天级显式绑定优先：同步清除该发送方在此聊天的「绑定我」残留。
+      // 否则发送方级优先级更高，聊天级绑定形同虚设（真实事故：绑定成功但
+      // 消息仍被旧「绑定我」拦截报「没有运行中的 Pi 实例」）。
+      const senderKey = `${req.chatId}|${req.senderId || ""}`;
+      const hadSenderBinding = !!rt.senderBindings[senderKey];
+      delete rt.senderBindings[senderKey];
       await saveBindings({
         chats: rt.chatBindings,
         senders: rt.senderBindings,
@@ -218,12 +224,15 @@ export function createBindSessionCommand(rt: BotRuntime): FastCommand {
       const inst = await findInstanceBySession(rt, target.path);
       const instLine = inst
         ? `- 承载实例: PID ${inst.pid}${inst.pid === rt.SELF_PID ? "（本实例）" : ""}`
-        : `- ⚠️ 该会话当前没有运行中的 Pi（启动后自动加入路由）`;
+        : `- ⚠️ 该会话当前没有运行中的 Pi（发 \`启动实例 <目录> 恢复\` 可远程拉起）`;
       await replyMarkdown(
         rt,
         req,
         [
           `📍 **已绑定路由**：本聊天 → 会话 **${targetName}**`,
+        ...(hadSenderBinding
+          ? [`- 🧹 已同步清除你在此聊天的「绑定我」残留（旧发送方级绑定不再拦截）`]
+          : []),
           `- **会话ID**: \`${target.id}\``,
           instLine,
           `- 之后本聊天的消息自动路由到该会话执行，回传结果到本聊天`,
@@ -243,8 +252,12 @@ export function createUnbindSessionCommand(rt: BotRuntime): FastCommand {
     localOnly: true,
     match: (text) => SESSION_UNBIND_RE.test(text.trim()),
     async execute(req) {
-      if (rt.chatBindings[req.chatId]) {
+      const senderKey = `${req.chatId}|${req.senderId || ""}`;
+      const hadChat = !!rt.chatBindings[req.chatId];
+      const hadSender = !!rt.senderBindings[senderKey];
+      if (hadChat || hadSender) {
         delete rt.chatBindings[req.chatId];
+        delete rt.senderBindings[senderKey];
         await saveBindings({
           chats: rt.chatBindings,
           senders: rt.senderBindings,
@@ -252,7 +265,9 @@ export function createUnbindSessionCommand(rt: BotRuntime): FastCommand {
         await replyMarkdown(
           rt,
           req,
-          "🔓 已解除本聊天的会话绑定，消息恢复进入当前所处会话。",
+          hadSender
+            ? "🔓 已解除本聊天的会话绑定（含你的「绑定我」发送方级绑定），消息恢复进入当前所处会话。"
+            : "🔓 已解除本聊天的会话绑定，消息恢复进入当前所处会话。",
         );
       } else {
         await replyMarkdown(rt, req, "○ 本聊天没有绑定会话。");
@@ -299,7 +314,7 @@ export function createBindMeCommand(rt: BotRuntime): FastCommand {
       const inst = await findInstanceBySession(rt, target.path);
       const instLine = inst
         ? `- 承载实例: PID ${inst.pid}${inst.pid === rt.SELF_PID ? "（本实例）" : ""}`
-        : `- ⚠️ 该会话当前没有运行中的 Pi（启动后自动加入路由）`;
+        : `- ⚠️ 该会话当前没有运行中的 Pi（发 \`启动实例 <目录> 恢复\` 可远程拉起）`;
       await replyMarkdown(
         rt,
         req,

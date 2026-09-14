@@ -11,9 +11,10 @@
  * 全部未命中 → 返回 false，由 message-handler 注入 pi。
  */
 import type { BotRuntime, FastCommand, RouteHandler } from "./types.ts";
+import { existsSync } from "node:fs";
 import { replyMarkdown } from "./sender.ts";
 import { TAG_ROUTE_RE } from "./utils.ts";
-import { freshBindings } from "./storage.ts";
+import { freshBindings, saveBindings } from "./storage.ts";
 import { currentSessionFile, findInstanceBySession } from "./instances.ts";
 import { routeToInstance } from "./mailbox.ts";
 import { sessionDisplayName } from "./utils.ts";
@@ -71,11 +72,30 @@ function bindingRouteHandler(rt: BotRuntime): RouteHandler {
     rt.senderBindings = table.senders;
     // 三元绑定查找：发送方级（同群不同人各绑各的）优先于聊天级
     const senderKey = `${req.chatId}|${msg.senderId || req.senderId || ""}`;
+    const viaSender = !!rt.senderBindings[senderKey];
     const boundPath = rt.senderBindings[senderKey] || table.chats[req.chatId];
     if (!boundPath || boundPath === currentSessionFile(rt)) return false;
 
+    // 会话文件已不存在（被删/移动）→ 绑定永久失效：自动清除并按默认路由放行
+    //（没有任何 pi 能再承载一个不存在的文件，报错只会永久卡死聊天）
+    if (!existsSync(boundPath)) {
+      if (viaSender) delete rt.senderBindings[senderKey];
+      else delete rt.chatBindings[req.chatId];
+      await saveBindings({ chats: rt.chatBindings, senders: rt.senderBindings });
+      await replyMarkdown(
+        rt,
+        req,
+        `🧹 绑定指向的会话文件已不存在，已自动清除${viaSender ? "「绑定我」发送方级" : "聊天级"}绑定，本条消息按默认路由处理。`,
+      );
+      return false;
+    }
+
     const target = await findInstanceBySession(rt, boundPath);
     if (!target) {
+      // 修复：绑定已失效也必须放行网关级指令（重新绑定/解绑/列表），
+      // 否则死绑定卡死聊天 —— 发 绑定会话/解绑会话 被错误回执拦截，永远解不开
+      const cmd: FastCommand | null = rt.svc.findFastCommand(text);
+      if (cmd?.localOnly) return false;
       const st = await sessionDisplayName({ path: boundPath, id: boundPath });
       await replyMarkdown(
         rt,
@@ -83,8 +103,9 @@ function bindingRouteHandler(rt: BotRuntime): RouteHandler {
         [
           `❌ 该会话当前没有运行中的 Pi 实例：`,
           `- 会话: **${st}**`,
+          `- 绑定来源: ${viaSender ? "「绑定我」（发送方级，优先于聊天级绑定）" : "「绑定会话」（聊天级）"}`,
           `- 先在对应终端启动 pi（可用 \`pi -r ${boundPath.split("/").pop()}\`），实例会自动加入路由。`,
-          `- 发 \`实例\` 查看当前运行中的实例。`,
+          `- 发 \`实例\` 查看当前运行中的实例；\`绑定会话 <关键词>\` 可重新绑定，\`解绑会话\` 解除。`,
         ].join("\n"),
       );
       return true;

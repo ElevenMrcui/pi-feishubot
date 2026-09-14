@@ -14,6 +14,17 @@ export function createReloadCommand(rt: BotRuntime, pi: any): FastCommand {
     match: (_text, lower) =>
       lower === "重载" || lower === "/reload" || RELOAD_RE.test(lower),
     async execute(req) {
+      // 任务执行中禁止重载：reload 会 invalidate 当前扩展上下文，正在跑的
+      // 请求其回复会永久丢失（与 `切会话` 同规则）
+      const busy = rt.currentCtx ? !rt.currentCtx.isIdle() : false;
+      if (busy) {
+        await replyMarkdown(
+          rt,
+          req,
+          "⏳ 当前有任务执行中，重载会丢失本次回复。请等任务结束后再发 `重载`（或先 `停止`）。",
+        );
+        return true;
+      }
       await replyMarkdown(
         rt,
         req,

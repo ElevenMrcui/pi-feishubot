@@ -57,7 +57,15 @@ export interface FeishuRequest {
  aliveTimer: NodeJS.Timeout | null; // 运行心跳定时器（占位期更新"仍在运行 n s"）
  progressTimer: NodeJS.Timeout | null; // worker 进度播报定时器（无流式卡片的实例）
  progressSent: number; // 已发进度条数（防刷屏上限）
+ /** 上一次工具播报签名（同一工具持续执行不重复刷屏） */
+ progressLastSig?: string;
  lastActivityAt: number; // 最近一次内容活动（delta/append）时间
+ /** flush 在途互斥：上轮未完成（等桶/网络）时跳过本轮，防重入叠加 */
+ streamFlushInFlight?: boolean;
+ /** 流式刷新失败退避：连续失败次数（指数退避防限频恶性循环） */
+ streamFailCount?: number;
+ /** 流式刷新失败退避：下次尝试时间戳（ms） */
+ streamNextAttemptAt?: number;
  startedAtMs?: number;
  finalized: boolean;
  viaInbox?: boolean; // 来自其它实例投递（回复走兜底直发，无流式卡片）
@@ -102,6 +110,16 @@ export interface RouteContext {
 /** 返回 true = 已消费（链终止）；false = 交给下一个处理器 */
 export type RouteHandler = (rc: RouteContext) => Promise<boolean>;
 
+export interface PendingReply {
+  messageId: string;
+  chatId: string;
+  req: FeishuRequest | null;
+  content: string;
+  stashedAt: number;
+  expiresAt: number;
+  timer: NodeJS.Timeout | null;
+}
+
 // ============================================================================
 // BotRuntime —— Singleton 共享可变状态 + Mediator 服务表
 // ============================================================================
@@ -140,9 +158,9 @@ export interface BotRuntime {
   startedAt: number;
  } | null;
 
- // ---- 去重 / 防重 ----
- seenMessages: Set<string>;
- finalizedMessageIds: Set<string>;
+ // ---- 去重 / 防重（值 = 写入时间戳，供周期清扫；替代逐条 setTimeout） ----
+ seenMessages: Map<string, number>;
+ finalizedMessageIds: Map<string, number>;
 
  // ---- 会话路由绑定表缓存 ----
  chatBindings: Record<string, string>;
@@ -166,6 +184,9 @@ export interface BotRuntime {
  // ---- 内部互斥标志 ----
  draining: boolean;
  outboxDraining: boolean;
+
+ /** 延投队列：agent_end 时未空闲（自动压缩/failover 续跑）的回复挂起，待空闲补投 */
+ pendingReplies: Map<string, PendingReply>;
 
  // ---- Mediator 服务表（组合根装配） ----
  svc: BotServices;

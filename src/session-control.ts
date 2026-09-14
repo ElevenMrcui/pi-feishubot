@@ -36,6 +36,33 @@ export async function resolveSessionTarget(
   if (rt.lastSessionList && idx >= 0 && idx < rt.lastSessionList.length) {
     return rt.lastSessionList[idx];
   }
+  const q = arg.toLowerCase();
+  // 实例目录优先（修复：关键词命中存活实例的项目目录时，直接解析为该实例
+  // 的当前会话）。用户输入「绑定会话 feishubot」的真实意图是「feishubot
+  // 项目正在运行的会话」；若落到首条消息模糊匹配，常绑到首条消息里碰巧
+  // 含该关键词的死会话（实例表有短 TTL 缓存，查询开销可忽略）。
+  try {
+    const { listLiveInstances } = await import("./instances.ts");
+    const live = await listLiveInstances(rt);
+    const inst =
+      live.find((x) => (x.cwd || "").toLowerCase().split("/").pop() === q) ||
+      live.find((x) => (x.cwd || "").toLowerCase().endsWith("/" + q)) ||
+      live.find((x) => (x.sessionName || "").toLowerCase().includes(q)) ||
+      null;
+    if (inst?.sessionFile) {
+      const stem = inst.sessionFile.split("/").pop() || inst.sessionFile;
+      return {
+        id: stem.replace(/\.jsonl$/, ""),
+        path: inst.sessionFile,
+        name:
+          inst.sessionName ||
+          `${(inst.cwd || "").split("/").pop() || stem}（运行中实例 PID ${inst.pid}）`,
+        modified: new Date(inst.heartbeat),
+      };
+    }
+  } catch (e) {
+    void e; // 实例表不可用 → 继续走会话库匹配
+  }
   try {
     // 变量间接引用：避免静态解析器报 Cannot find module（运行时由 pi 的 jiti virtualModules 解析）
     const pkg = "@mariozechner/pi-coding-agent";
@@ -50,7 +77,6 @@ export async function resolveSessionTarget(
       all = await SessionManager.listAll();
     }
     all.sort((a: any, b: any) => +new Date(b.modified) - +new Date(a.modified));
-    const q = arg.toLowerCase();
     return (
       all.find((s: any) => s.id.toLowerCase() === q) ||
       (q.length >= 6

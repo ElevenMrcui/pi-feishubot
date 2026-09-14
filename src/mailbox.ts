@@ -16,6 +16,19 @@ import { existsSync, watch as fsWatch } from "node:fs";
 import { INBOX_ROOT } from "./storage.ts";
 import type { BotRuntime, FeishuRequest, InstanceInfo } from "./types.ts";
 import { listLiveInstances } from "./instances.ts";
+import { sleep } from "./utils.ts";
+
+// ======== 信箱 watch 看门狗（探针自愈）========
+// FSEvents 静默失效无异常可捕获：周期性写探针文件，若 watch 未在容差内
+// 反应 → 判定失效，立即重挂。比 3s 兕底轮询更快恢复事件驱动投递。
+let probeTimer: NodeJS.Timeout | null = null;
+let probeSeenAt = 0;
+const PROBE_INTERVAL_MS = 30_000;
+const PROBE_TOLERANCE_MS = 4_000;
+// 死信接管扫描降频：接管/清目录要遍历整个 INBOX_ROOT，60s 一次足够
+// （消息投递路径不依赖它：直接写给存活实例的信箱照常即时消费）
+let lastTakeoverScanAt = 0;
+const TAKEOVER_SCAN_INTERVAL_MS = 60_000;
 
 /** 安全投递：异步操作永不冒泡为 unhandledRejection（feishubot 不得崩掉 pi 宿主） */
 function safeFire(p: Promise<unknown>, label: string) {
@@ -98,8 +111,7 @@ async function processInboxRaw(rt: BotRuntime, pi: any, raw: string) {
   }
   if (!payload?.messageId || !payload?.chatId || !payload?.text) return;
   if (rt.seenMessages.has(payload.messageId)) return;
-  rt.seenMessages.add(payload.messageId);
-  setTimeout(() => rt.seenMessages.delete(payload.messageId), 10 * 60 * 1000);
+  rt.seenMessages.set(payload.messageId, Date.now());
 
   const req: FeishuRequest = {
     chatId: payload.chatId,
@@ -164,56 +176,75 @@ export async function drainInbox(rt: BotRuntime, pi: any) {
   rt.draining = true;
   try {
     // 死信转移：其它实例的信箱若属已死进程 → 存活实例接管消化
-    // （仅网关执行，避免多实例重复转移）；转移用 rename，天然走正常处理路径
-    if (rt.isGateway && rt.channel) {
+    // （仅网关执行，避免多实例重复转移；60s 降频扫描，转移用 rename，
+    // 天然走正常处理路径）
+    if (
+      rt.isGateway &&
+      rt.channel &&
+      Date.now() - lastTakeoverScanAt > TAKEOVER_SCAN_INTERVAL_MS
+    ) {
+      lastTakeoverScanAt = Date.now();
+      let livePids: Set<number> | null = null;
       try {
         const live = await listLiveInstances(rt);
-        const livePids = new Set(live.map((x) => x.pid));
-        if (existsSync(INBOX_ROOT)) {
-          for (const d of await readdir(INBOX_ROOT)) {
-            const pid = parseInt(d, 10);
-            if (Number.isNaN(pid) || livePids.has(pid) || pid === rt.SELF_PID)
-              continue;
-            const deadDir = inboxDir(rt, pid);
-            let files: string[] = [];
-            try {
-              files = (await readdir(deadDir)).filter((f) => f.endsWith(".json"));
-            } catch (e) {
-              void e; // 目录已消失
-              continue;
-            }
-            if (!files.length) continue;
-            console.log(
-              `[feishubot] 接管已死实例 PID ${pid} 的 ${files.length} 条信件`,
+        livePids = new Set(live.map((x) => x.pid));
+      } catch (e) {
+        void e; // 实例表不可用 → 本轮跳过接管与清理
+      }
+      if (livePids && existsSync(INBOX_ROOT)) {
+        for (const d of await readdir(INBOX_ROOT)) {
+          const pid = parseInt(d, 10);
+          if (Number.isNaN(pid) || livePids.has(pid) || pid === rt.SELF_PID)
+            continue;
+          const deadDir = inboxDir(rt, pid);
+          try {
+            // 1) 未消化信件 → 接管到自己 inbox（rename 天然走正常处理路径：
+            //    读→删→解析，无 ENOENT、无内容丢失）
+            const letters = (await readdir(deadDir).catch(() => [])).filter(
+              (f) => f.endsWith(".json"),
             );
-            for (const f of files) {
-              // rename 到自己信箱：本轮 drainInbox 后半段按正常路径处理
-              // （读→删→解析），无 ENOENT、无内容丢失
-              const full = join(deadDir, f);
-              await rename(full, join(inboxDir(rt, rt.SELF_PID), f)).catch(
+            if (letters.length) {
+              console.log(
+                `[feishubot] 接管已死实例 PID ${pid} 的 ${letters.length} 条信件`,
+              );
+              for (const f of letters) {
+                await rename(join(deadDir, f), join(inboxDir(rt, rt.SELF_PID), f)).catch(() => {});
+              }
+            }
+            // 2) 死网关遗留的代发回复 → 挪进自己 outbox 补发
+            //（整目录回收前必须先救出来，否则丢失本该代发的回复）
+            const deadOut = join(deadDir, "outbox");
+            const stranded = (await readdir(deadOut).catch(() => [])).filter(
+              (f) => f.endsWith(".json"),
+            );
+            for (const f of stranded) {
+              console.log(`[feishubot] 接管已死网关 PID ${pid} 的代发回复 ${f}`);
+              await rename(
+                join(deadOut, f),
+                join(inboxDir(rt, rt.SELF_PID), "outbox", f),
+              ).catch(() => {});
+            }
+            // 3) 确认无信件后整目录回收。旧实现要求目录 readdir 为空，但每个实例
+            //    目录都有 outbox 子目录占位 → 条件永不成立，实测死目录堆积 25 个
+            const hasMail = async (dir: string) =>
+              (await readdir(dir).catch(() => [])).some((f) =>
+                f.endsWith(".json"),
+              );
+            if (
+              !(await hasMail(deadDir)) &&
+              !(await hasMail(join(deadDir, "outbox")))
+            ) {
+              await rm(deadDir, { recursive: true, force: true }).catch(
                 () => {},
               );
             }
+          } catch (e) {
+            void e; // 单实例失败 → 下一轮重试
           }
         }
-      } catch (e) {
-        void e; // 死信转移失败 → 下一轮心跳重试
-      }
-      // 死实例的空目录清理
-      try {
-        for (const d of await readdir(INBOX_ROOT)) {
-          const pid = parseInt(d, 10);
-          if (!livePids?.has(pid) && pid !== rt.SELF_PID) {
-            const p = inboxDir(rt, pid);
-            if (existsSync(p) && (await readdir(p)).length === 0) {
-              await rm(p, { recursive: true, force: true }).catch(() => {});
-            }
-          }
-        }
-      } catch (e) {
-        void e; // 清理失败无害
       }
     }
+
     const dir = inboxDir(rt, rt.SELF_PID);
     if (!existsSync(dir)) return;
     for (const f of await readdir(dir)) {
@@ -264,6 +295,56 @@ export function startInboxWatcher(rt: BotRuntime) {
       if (rt.isGateway && rt.channel) safeFire(rt.svc.drainOutbox(), "drainOutbox");
     }, 3000);
   }
+  // watch 看门狗：周期探针验证 FSEvents 活性，静默失效立即重挂
+  if (!probeTimer) {
+    probeTimer = setInterval(() => {
+      safeFire(runWatchdogProbe(rt), "watchdogProbe");
+    }, PROBE_INTERVAL_MS);
+  }
+}
+
+/** 停止信箱监听（探针 + watcher；session_shutdown 用） */
+export function stopInboxWatcher(rt: BotRuntime) {
+  if (probeTimer) {
+    clearInterval(probeTimer);
+    probeTimer = null;
+  }
+  for (const slot of ["inboxWatcher", "outboxWatcher"] as const) {
+    const w = (rt as any)[slot];
+    if (w) {
+      try {
+        w.close();
+      } catch (e) {
+        void e; // watcher 未初始化
+      }
+      (rt as any)[slot] = null;
+    }
+  }
+}
+
+async function runWatchdogProbe(rt: BotRuntime) {
+  const dir = inboxDir(rt, rt.SELF_PID);
+  probeSeenAt = 0;
+  try {
+    await writeFile(join(dir, ".probe"), String(Date.now()));
+  } catch (e) {
+    void e; // 目录还没建好 → ensureDirsAndWatch 会建
+    return;
+  }
+  await sleep(PROBE_TOLERANCE_MS);
+  if (probeSeenAt === 0) {
+    console.log("[feishubot] watchdog：inbox watcher 无响应，重挂…");
+    attachWatch(rt, "inboxWatcher", dir, makeInboxChange(rt));
+    // 重挂后立即补一轮 drain（失效期间的信件可能已堆积）
+    safeFire(rt.svc.drainInbox(), "drainInbox");
+  }
+}
+
+function makeInboxChange(rt: BotRuntime) {
+  return () => {
+    probeSeenAt = Date.now();
+    safeFire(rt.svc.drainInbox(), "drainInbox");
+  };
 }
 
 async function ensureDirsAndWatch(rt: BotRuntime) {
@@ -282,7 +363,7 @@ async function ensureDirsAndWatch(rt: BotRuntime) {
     }
   }
 
-  attachWatch(rt, "inboxWatcher", dir, () => safeFire(rt.svc.drainInbox(), "drainInbox"));
+  attachWatch(rt, "inboxWatcher", dir, makeInboxChange(rt));
   attachWatch(rt, "outboxWatcher", outDir, () => safeFire(rt.svc.drainOutbox(), "drainOutbox"));
 
   // 启动时处理残留（上次崩溃/退出未消费的）

@@ -8,6 +8,17 @@ export function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * TTL Map 周期清扫：替代「每条消息一个 setTimeout」的逐条过期，
+ * 长稳运行时定时器数量恒定（seenMessages 10min / finalizedMessageIds 30min）。
+ */
+export function sweepTtlMap(m: Map<string, number>, ttlMs: number) {
+  const now = Date.now();
+  for (const [k, ts] of m) {
+    if (now - ts > ttlMs) m.delete(k);
+  }
+}
+
 // ---- 指令正则（Command 模式的匹配契约；命令实现引用这些常量） ----
 
 /** reload 常见错拼容错（rwload/relaod/rewload…） */

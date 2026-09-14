@@ -18,10 +18,9 @@ export function createMessageHandler(rt: BotRuntime, pi: any) {
     // bot 消息跳过（防回环）
     if (msg.senderIsBot) return;
 
-    // 去重兜底
+    // 去重兜底（值 = 时间戳，心跳周期清扫）
     if (rt.seenMessages.has(msg.messageId)) return;
-    rt.seenMessages.add(msg.messageId);
-    setTimeout(() => rt.seenMessages.delete(msg.messageId), 10 * 60 * 1000);
+    rt.seenMessages.set(msg.messageId, Date.now());
 
     const text = (msg.content || "").trim();
 
