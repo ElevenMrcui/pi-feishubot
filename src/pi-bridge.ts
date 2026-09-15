@@ -15,7 +15,7 @@ import { mkdir as _mkdir } from "node:fs/promises";
 import { join as _join } from "node:path";
 import { homedir as _homedir } from "node:os";
 import type { BotRuntime, FeishuRequest, PendingReply } from "./types.ts";
-import { finalizeRequest, ensureStream, stopProgressNotifier } from "./streaming.ts";
+import { finalizeRequest, ensureStream } from "./streaming.ts";
 import { sendReplyOut } from "./sender.ts";
 import { summarizeArgs } from "./utils.ts";
 import { readBindings } from "./storage.ts";
@@ -356,8 +356,8 @@ async function deliverReply(
   if (req && !req.viaInbox) {
     await finalizeRequest(rt, req, text);
   } else {
-    // 跨实例投递的消息（无流式卡片）：先停进度播报，再走回复出口
-    if (req) stopProgressNotifier(req);
+    // 跨实例投递的消息（无流式卡片）：直接走回复出口（中间进度播报已移除，
+    // 工具状态改为按需拉取：发 `状态` 可看执行中的工具与耗时）
     await sendReplyOut(rt, chatId, text);
   }
 }

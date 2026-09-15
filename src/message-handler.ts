@@ -49,9 +49,7 @@ export function createMessageHandler(rt: BotRuntime, pi: any) {
       aliveTimer: null,
       lastActivityAt: 0,
       startedAtMs: Date.now(),
-      progressTimer: null,
-        progressSent: 0,
-        finalized: false,
+      finalized: false,
     };
 
     // 执行路由链（@标签 → 绑定表 → 本地快捷指令），命中即终止

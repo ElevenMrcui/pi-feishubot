@@ -10,7 +10,7 @@
  * - finalize：setContent 全文定格；失败回落普通回复
  */
 import type { BotRuntime, FeishuRequest } from "./types.ts";
-import { replyMarkdown, sendToChat } from "./sender.ts";
+import { replyMarkdown } from "./sender.ts"; // sendToChat 随进度播报一并移除
 
 export const STREAM_FLUSH_MS = 700;
 
@@ -236,7 +236,6 @@ export async function finalizeRequest(
   req.finalized = true;
   req.phase = "done";
   clearAckTimer(req);
-  stopProgressNotifier(req);
   if (req.aliveTimer) {
     clearInterval(req.aliveTimer);
     req.aliveTimer = null;
@@ -290,52 +289,10 @@ function sleep(ms: number) {
 }
 
 // ========================================================================
-// worker 进度播报（无流式卡片实例的状态可见性）
-// ========================================================================
-
-const PROGRESS_TICK_MS = 30_000; // 30s 节流
-const PROGRESS_MAX_SENDS = 20; // 单请求上限，防刷屏
-
-/**
- * worker 进度播报（安静版）：仅在「有真实工具活动且工具发生变化」时播报一条，
- * 纯思考 / 生成回答阶段不发消息（用户要求：过程中的“思考/生成回答中”属噪声，
- * 等最终回复即可）。网关实例有流式卡片（streamCtrl），整个机制自动跳过。
- */
-export function startProgressNotifier(rt: BotRuntime, req: FeishuRequest) {
-  if (req.progressTimer) return;
-  if (rt.channel) return; // 网关：有打字机卡片，无需文本播报
-  req.progressSent = 0;
-  req.progressLastSig = "";
-  req.progressTimer = setInterval(async () => {
-    if (req.finalized) {
-      stopProgressNotifier(req);
-      return;
-    }
-    if (req.progressSent >= PROGRESS_MAX_SENDS) {
-      stopProgressNotifier(req);
-      return;
-    }
-    const info = rt.activeToolInfo;
-    // 无工具活动 = 思考/生成中 → 静默（不发任何消息）
-    if (!info) return;
-    const sec = Math.round((Date.now() - (req.startedAtMs || Date.now())) / 1000);
-    const sig = `${info.name}|${info.argsSummary}`;
-    // 同一工具持续执行 → 不重复刷屏
-    if (sig === req.progressLastSig) return;
-    req.progressLastSig = sig;
-    const tool = `正在执行 \`${info.name}\`${info.argsSummary ? ` (${info.argsSummary})` : ""}`;
-    try {
-      await sendToChat(rt, req.chatId, `⏳ [${sec}s] ${tool}`);
-      req.progressSent++;
-    } catch (e) {
-      void e; // 单次播报失败 → 下轮重试
-    }
-  }, PROGRESS_TICK_MS);
-}
-
-export function stopProgressNotifier(req: FeishuRequest) {
-  if (req.progressTimer) {
-    clearInterval(req.progressTimer);
-    req.progressTimer = null;
-  }
-}
+// worker 进度播报：已按产品要求移除（2.4.3）
+//
+// 原实现每 30s 向聊天推一条 `⏳ [Ns] 正在执行 `bash` (…)`，用户两次明确要求
+// 长任务过程中的中间消息不要推送（先「思考/生成回答中」，再「执行脚本类命令」）。
+// 工具状态不再主动播报，改为按需拉取：发 `状态` 可看当前正在执行的工具与耗时
+// （rt.activeToolInfo 仍在采集，仅去掉推送侧）。
+// 收益：长任务期间聊天零噪声；每请求少一个 30s 定时器与若干条 send 调用。

@@ -223,8 +223,6 @@ async function processInboxRaw(rt: BotRuntime, pi: any, raw: string) {
     streamAppended: 0,
     ackTimer: null,
     aliveTimer: null,
-    progressTimer: null,
-    progressSent: 0,
     lastActivityAt: 0,
     startedAtMs: Date.now(),
     finalized: false,
@@ -263,9 +261,7 @@ async function processInboxRaw(rt: BotRuntime, pi: any, raw: string) {
     return;
   }
   rt.svc.scheduleAck(req);
-  // 无流式卡片的实例：启动文本进度播报（30s 节流，工具级状态可见）
-  const { startProgressNotifier } = await import("./streaming.ts");
-  startProgressNotifier(rt, req);
+  // 不再启动中间进度播报（产品要求：长任务执行期间不推工具/脚本类中间消息）
 }
 
 export async function drainInbox(rt: BotRuntime, pi: any) {

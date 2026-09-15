@@ -55,10 +55,6 @@ export interface FeishuRequest {
  streamPlaceholder?: string | null; // "处理中"占位文本（占位卡首刷时覆盖）
  ackTimer: NodeJS.Timeout | null; // 占位回执定时器
  aliveTimer: NodeJS.Timeout | null; // 运行心跳定时器（占位期更新"仍在运行 n s"）
- progressTimer: NodeJS.Timeout | null; // worker 进度播报定时器（无流式卡片的实例）
- progressSent: number; // 已发进度条数（防刷屏上限）
- /** 上一次工具播报签名（同一工具持续执行不重复刷屏） */
- progressLastSig?: string;
  lastActivityAt: number; // 最近一次内容活动（delta/append）时间
  /** flush 在途互斥：上轮未完成（等桶/网络）时跳过本轮，防重入叠加 */
  streamFlushInFlight?: boolean;
