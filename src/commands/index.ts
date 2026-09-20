@@ -8,6 +8,7 @@ import type { BotRuntime, FastCommand } from "../types.ts";
 import {
   createHelpCommand,
   createNewSessionCommand,
+  createSendImageCommand,
   createStatusCommand,
   createStopCommand,
 } from "./basic.ts";
@@ -61,6 +62,7 @@ export function createCommandRegistry(
   const commands: FastCommand[] = [
     createHelpCommand(rt),
     createStopCommand(rt),
+    createSendImageCommand(rt),
     createStatusCommand(rt),
     createNewSessionCommand(rt, pi),
     createCurrentModelCommand(rt),

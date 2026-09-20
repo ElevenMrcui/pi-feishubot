@@ -29,6 +29,9 @@ import { sendToChat } from "./sender.ts";
 import { scheduleAck } from "./streaming.ts";
 import { drainInbox, drainOutbox } from "./mailbox.ts";
 import { registerPiObservers, registerPiCommands } from "./pi-bridge.ts";
+import { sendImageToChat, findBoundChatId } from "./image.ts";
+// @ts-ignore —— typebox 由 pi 宿主提供（jiti 从 pi 的 node_modules 解析），本包内无需依赖
+import { Type } from "typebox";
 
 export default function main(pi: any) {
  // Singleton：本进程唯一的共享状态容器
@@ -54,6 +57,63 @@ export default function main(pi: any) {
  // ---- 注册观察者与命令 ----
  registerPiObservers(rt, pi);
  registerPiCommands(rt, pi);
+
+ // ---- 自定义工具：send_image（LLM 可直接调用，v2.5.0）----
+ // 目标聊天优先级：显式 chatId > 反查绑定到本实例当前会话的聊天
+ pi.registerTool?.({
+  name: "send_image",
+  label: "发送图片到飞书",
+  description:
+    "把本地图片文件（png/jpg/gif/webp 等，≤10MB）发送到飞书聊天。" +
+    "不传 chatId 时发送到「绑定到当前会话」的聊天；若当前会话未绑定任何聊天会报错，" +
+    "提示用户在飞书里发 `绑定会话 <关键词>`，或从 `状态`/绑定表中拿 chatId 显式传入。",
+  parameters: Type.Object({
+   path: Type.String({ description: "本地图片绝对路径" }),
+   chatId: Type.Optional(
+    Type.String({ description: "可选：目标飞书聊天 ID（oc_ 开头）" }),
+   ),
+  }),
+  async execute(
+   toolCallId: string,
+   params: { path: string; chatId?: string },
+   _signal: any,
+   _onUpdate: any,
+   _ctx: any,
+  ) {
+   void toolCallId; void _signal; void _onUpdate; void _ctx;
+   try {
+    let p = (params?.path || "").trim();
+    if (p.startsWith("~")) p = p.replace(/^~(?=$|\/)/, process.env.HOME || "");
+    const chatId = (params?.chatId || "").trim() || findBoundChatId(rt);
+    if (!chatId) {
+     return {
+      content: [
+       {
+        type: "text",
+        text: "❌ 未找到目标聊天：当前会话没有绑定任何飞书聊天。请在飞书聊天里发 `绑定会话 <关键词>`，或显式传入 chatId（oc_ 开头）。",
+       },
+      ],
+      details: {},
+     };
+    }
+    const messageId = await sendImageToChat(rt, chatId, p);
+    return {
+     content: [
+      {
+       type: "text",
+       text: `✅ 图片已发送到 ${chatId}${messageId ? `（message_id: ${messageId}）` : ""}`,
+      },
+     ],
+     details: { chatId, messageId },
+    };
+   } catch (e: any) {
+    return {
+     content: [{ type: "text", text: `❌ 图片发送失败: ${e?.message || e}` }],
+     details: {},
+    };
+   }
+  },
+ });
 }
 
 // teardown/reconnect 语义保留在 channel-gateway（pi-bridge 的命令与 shutdown 直接调用）

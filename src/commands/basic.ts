@@ -53,6 +53,29 @@ export function createHelpCommand(rt: BotRuntime): FastCommand {
 
 // ---------------------------------------------------------------- 停止
 
+// ---------------------------------------------------------------- 发图
+
+/** `发图 <本地路径>`：把 Mac 上的图片直接发进当前聊天（v2.5.0） */
+export function createSendImageCommand(rt: BotRuntime): FastCommand {
+  return {
+    name: "send-image",
+    match: (text) => /^发图\s+\S+/i.test(text.trim()),
+    async execute(req, text) {
+      let p = text.trim().match(/^发图\s+(\S+)/i)?.[1] || "";
+      if (p.startsWith("~")) p = p.replace(/^~(?=$|\/)/, process.env.HOME || "");
+      const { sendImageToChat } = await import("../image.ts");
+      try {
+        await sendImageToChat(rt, req.chatId, p);
+        // 图片消息本身无法带文字，成功后补一张轻量回执
+        await replyMarkdown(rt, req, `✅ 已发送 \`${p}\``);
+      } catch (e: any) {
+        await replyMarkdown(rt, req, `❌ 发图失败: ${e?.message || e}`);
+      }
+      return true;
+    },
+  };
+}
+
 export function createStopCommand(rt: BotRuntime): FastCommand {
   return {
     name: "stop",
